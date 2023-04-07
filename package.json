@@ -1,0 +1,14 @@
+{
+  "name": "zenn-content",
+  "version": "1.0.0",
+  "repository": "git@github.com:lemolatoon/zenn-content.git",
+  "author": "lemolatoon <63438515+lemolatoon@users.noreply.github.com>",
+  "license": "NO LICENSE",
+  "private": false,
+  "scripts": {
+    "preview": "zenn preview"
+  },
+  "dependencies": {
+    "zenn-cli": "^0.1.141"
+  }
+}
