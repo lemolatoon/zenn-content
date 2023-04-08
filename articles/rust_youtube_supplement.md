@@ -218,3 +218,90 @@ where
 
 です。
 戻り値は「`'a`のライフタイムをもつ借用」です。言い換えれば、引数の`x`または`y`が`drop`するときに、戻り値も`drop`するということです。実際この関数では、`x`または`y`が戻り値となっているので、意味的にもあっているように見えます。
+
+## トレイトオブジェクトとジェネリクスの違い
+```rust
+pub trait Draw {
+    fn draw(&self) {}
+}
+
+pub struct A(usize);
+pub struct B(isize);
+
+impl Draw for A {}
+impl Draw for B {}
+
+pub struct Screen1 {
+    pub components: Vec<Box<dyn Draw>>,
+}
+
+pub struct Screen2<T: Draw> {
+    pub components: Vec<T>,
+}
+
+fn main() {
+    let screen1 = Screen1 {
+        components: vec![Box::new(A(1)), Box::new(B(2))],
+    };
+// !!! COMPILE ERROR
+//    let screen2 = Screen2 {
+//        components: vec![A(1), B(2)],
+//    };
+}
+```
+この例がトレイトオブジェクトとジェネリクスの違いをよく表しています。
+トレイトオブジェクトはあるトレイトを実装していれば、（`Box`に包めば）どんな型でも受け付ける型です。
+一方、上の`Screen2`はあくまで、あるトレイト（ここでは`Draw`）を実装している型`T`を元に**コンパイル時**に単相化します。
+```rust
+pub struct A(usize);
+pub struct B(isize);
+
+impl Draw for A {}
+impl Draw for B {}
+
+pub struct Screen2<T: Draw> {
+    pub components: Vec<T>,
+}
+
+fn main() {
+    let screen2: Screen2<A> = Screen2 {
+        components: vec![A(1), A(2)],
+    };
+
+    let screen2: Screen2<A> = Screen2 {
+        components: vec![B(1), B(2)],
+    };
+}
+```
+上の例は以下のように単相化されます。
+```rust
+pub struct A(usize);
+pub struct B(isize);
+
+impl Draw for A {}
+impl Draw for B {}
+
+pub struct Screen2ForA {
+    pub components: Vec<A>,
+}
+pub struct Screen2ForB {
+    pub components: Vec<B>,
+}
+
+fn main() {
+    let screen2: Screen2ForA = Screen2ForA {
+        components: vec![A(1), A(2)],
+    };
+
+    let screen2: Screen2ForB = Screen2ForB {
+        components: vec![B(1), B(2)],
+    };
+}
+```
+このような単相化の様子を見れば、トレイトオブジェクトとの違いが分かると思います。
+一方、トレイトオブジェクト型はそれ自体は単一の型でありながら、複数の型を許容します。
+```rust
+let a: Box<dyn Draw> = Box::new(A(1)); // OK
+let b: Box<dyn Draw> = Box::new(B(1)); // OK
+```
+つまり、`Box<A>`型は`Box<dyn Draw>`型になれるし、`Box<B>`型は`Box<dyn Draw>`型になることができます。
