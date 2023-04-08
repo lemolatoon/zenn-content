@@ -9,6 +9,28 @@ published: false
 ## この記事はなに？
 私（lemolatoon）は、この度[the book](https://doc.rust-jp.rs/book-ja/)を解説する動画を出しました。そこで、動画上で詳しく触れられなかった点について、この記事に補足として書いていきます。
 
+## 参照の型とは
+Rustでは全ての変数が一つの型を持っています。それがなにかの変数を借用したものであっても同じです。
+```rust
+let a: i32 = 5;
+```
+Rustでは上のように、変数の型（`i32`）に注釈をつけられます。ただし、通常は推論されるため不要です。ここでは、不変借用や可変借用などの型を示すために、型注釈をすべてにつけてサンプルコードを示します。
+```rust
+fn main() {
+    let s: &str = "abc";
+    let mut a: String = String::from(s);
+    {
+        let b: &mut String = &mut a; // 型`T`の変数を可変借用した変数の型は`&mut T`
+    }
+    let b: &String = &a; // 型`T`の変数を不変借用した変数の型は`&T`
+    f(b);
+}
+
+fn f(s: &String) {
+    panic!("Not implemented.");
+}
+```
+
 ## `impl<T, U>`の読み方
 次のようなコードの例を考えます。
 
