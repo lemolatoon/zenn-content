@@ -9,7 +9,7 @@ published: false
 ## この記事はなに？
 私（lemolatoon）は、この度[the book](https://doc.rust-jp.rs/book-ja/)を解説する動画を出しました。そこで、動画上で詳しく触れられなかった点について、この記事に補足として書いていきます。
 
-## `impl<T, U>` の読み方
+## `impl<T, U>`の読み方
 次のようなコードの例を考えます。
 
 ```rust
@@ -67,3 +67,132 @@ fn mixup<V, W>(self, other: Point<V, W>) -> Point<T, W> {
  - $\forall T, U \in H, \forall V, W \in H (Hは型全体の集合)$ に対して、関数`mixup`を定義します。
 
 ここで重要なのは、`impl<T, U>`や`mixup<V, W>`などによって、`T`などの型引数が**宣言**されていおり、(型引数が$\forall$によって固定されているため、)その後にでてくる、`Point<T, U>`や`Point<V, W>`などは、**具体的な型**であるという点です。
+
+## Rustのthe bookの関数（with ライフタイム、ジェネリクス）の解説
+```rust
+fn main() {
+    let string1 = String::from("abcd");
+    let string2 = "xyz";
+
+    let result = longest_with_an_announcement(
+        string1.as_str(),
+        string2,
+        "Today is someone's birthday!",
+    );
+    println!("The longest string is {}", result);
+}
+
+use std::fmt::Display;
+
+fn longest_with_an_announcement<'a, T>(
+    x: &'a str,
+    y: &'a str,
+    ann: T,
+) -> &'a str
+where
+    T: Display,
+{
+    //       "アナウンス！ {}"
+    println!("Announcement! {}", ann);
+    if x.len() > y.len() {
+        x
+    } else {
+        y
+    }
+}
+```
+
+ここでポイントになっているのは3つあります。
+1. ジェネリクス`T`
+2. `where`によるトレイト境界
+3. ライフタイム`'a`
+
+### ジェネリクス`T`
+1.は `impl<T, U>の読み方`で話した通りです。
+### `where`によるトレイト境界
+これまで、ジェネリクスは、
+```rust
+fn f<T>(x: T) {...}
+```
+であれば、
+ - 「任意の型引数`T`をとってきます。(`T`が固定されているもとで、)関数`f`を定義します。」
+ - $\forall T \in H (Hは型全体の集合)$ に対して、関数`f`を定義します。
+
+と解釈できました。
+トレイト境界がついているような下の例は次のように解釈できます。
+```rust
+fn f<T>(x: T)
+where
+    T: Display
+{...}
+```
+ - 「トレイト`Display`が`impl`されている任意の型引数`T`をとってきます。(`T`が固定されているもとで、)関数`f`を定義します。」
+ - $\forall T \in H$ ($H$は`Display`を`impl`している型の全体の集合) に対して、関数`f`を定義します。
+ 
+このように、宣言している型引数が選ばれてくる元（もと）の集合、つまり宣言している型引数が選ばれる可能性のある型全体の集合、が「この世にある型全体の集合」ではなく、「`Display`を`impl`した型全体の集合」とすれば、これまでのジェネリクスと同じように`where`を解釈できます。
+
+### ライフタイム`'a`
+実はライフタイムについても、これまでのジェネリクスに対して行っていた考えを同じように適用できます。
+```rust
+fn f<'a>(x: &'a str) {...}
+```
+という関数宣言は、次のように解釈できます。
+ - 「任意のライフタイム`'a`をとってきます。(`'a`が固定されているもとで、)関数`f`を定義します。」
+ - $\forall$ `'a` $\in L (Lはライフタイム全体の集合)$ に対して、関数`f`を定義します。
+ 
+
+ここで意識したいのは、「Rustにおいて、ライフタイム、つまり『いつまでその参照が有効なのか』というのが、すべての借用変数について明確である」ということです。ただ、借用を受け取る関数については、どんなライフタイムを持つ借用に対しても共通の処理をしたい（どんな型に対しても共通の処理をしたいという、ジェネリクスと同じ）という要望から、ライフタイムを書いています。
+上で上げたライフタイム注釈を持つ関数`f`ですが、本来ならばこの注釈は省略できます。ライフタイム注釈をつけなければいけないのは「**複数の借用同士の関係を示すとき**」です。
+the book で出てきた例には以下のようなものがありました。
+```rust
+fn longest<'a>(x: &'a str, y: &'a str) -> &'a str {
+```
+引数の型と引数の型に３つの借用が出てきており、その関係が示されています。上の`longest`という関数では、すべての借用が同じライフタイムを持つことが分かります。（正確にはより長いライフタイムが短いライフタイムへ強制されることがあります。[参考](https://doc.rust-lang.org/nomicon/subtyping.html)）
+
+ここまでで、
+1. ジェネリクス`T`
+2. `where`によるトレイト境界
+3. ライフタイム`'a`
+
+について復習しました。もう一度はじめに提示して関数を提示します。
+```rust
+fn main() {
+    let string1 = String::from("abcd");
+    let string2 = "xyz";
+
+    let result = longest_with_an_announcement(
+        string1.as_str(),
+        string2,
+        "Today is someone's birthday!",
+    );
+    println!("The longest string is {}", result);
+}
+
+use std::fmt::Display;
+
+fn longest_with_an_announcement<'a, T>(
+    x: &'a str,
+    y: &'a str,
+    ann: T,
+) -> &'a str
+where
+    T: Display,
+{
+    //       "アナウンス！ {}"
+    println!("Announcement! {}", ann);
+    if x.len() > y.len() {
+        x
+    } else {
+        y
+    }
+}
+```
+ここまでが理解できていれば、`longest_with_an_announcement`関数が以前より簡単に見えていると思います。
+`'a`は任意のライフタイム、`T`は`Display`を`impl`した任意の型です。
+引数は
+ - x: `'a`のライフタイムをもつ借用
+ - y: `'a`のライフタイムをもつ借用
+ - ann: 型`T` （`Display`を`impl`しているので、`println!("{}", ann)`で表示できる。）
+
+です。
+戻り値は「`'a`のライフタイムをもつ借用」です。言い換えれば、引数の`x`または`y`が`drop`するときに、戻り値も`drop`するということです。実際この関数では、`x`または`y`が戻り値となっているので、意味的にもあっているように見えます。
