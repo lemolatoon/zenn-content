@@ -349,3 +349,64 @@ fn main() {
 1. vtableの場所
 2. vtable上の自分のトレイト関数の実装を示すオフセット
 の２つの情報をトレイトオブジェクトは持つことで、実行時の動的な呼び分けを実現しています。また、このような関数の呼び分け方法を「ダイナミックディスパッチ」と呼びます。
+
+## Associated Function(関連する関数)の型の読み方
+
+structやenumに対して、関連する関数を定義したいときには、`impl`キーワードで書いていき、各関数で自分自身を参照するときには、`self`キーワードを用います。以下は例です。
+```rust
+struct A {
+    x: String,
+}
+
+impl A {
+    // ①
+    fn jsut_move_me(self) -> String {
+        self.x
+    }
+    // ②: `&self`は`self: &Self`のシンタックスシュガー
+    fn use_this_as_immutable(&self) -> &String {
+        &self.x
+    }
+    // ③: `&mut self`は`self: &mut Self`のシンタックスシュガー
+    fn use_this_as_mutable(&mut self) -> &mut String {
+        &mut self.x
+    }
+}
+```
+### パターン１
+パターン１では、引数に`self`をとります。この関数を呼ぶと、呼び出し元のstructやenumはその時点でmoveします。
+また、この関数内で`self`と書いたときは、その型は`A`です。（ここでは構造体`A`に`impl`しているため）
+
+### パターン２
+パターン２では、引数に`&self`をとります。この関数を呼ぶと、呼び出し元のstructやenumの不変参照を取ります。
+また、この関数内で`self`と書いたときは、その型は`&A`です。
+ただし、`&A`型の`self`から、メンバの`x`にアクセスしたいときは、
+```rust
+(*self).x
+```
+と書く必要はなく、
+```rust
+self.x
+```
+で実現できます。パターン３の`&mut A`の場合も同じです。
+
+### パターン３
+パターン２では、引数に`&mut self`をとります。この関数を呼ぶと、呼び出し元のstructやenumの可変参照を取ります。
+また、この関数内で`self`と書いたときは、その型は`&mut A`です。
+
+### MyBoxに対するDerefトレイト実装を再読
+```rust
+struct MyBox<T>(T);
+
+use std::ops::Deref;
+
+impl<T> Deref for MyBox<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+```
+`Deref`トレイトはある型`U`に対して、別の型`T`が存在して、`&U`から`&T`への変換方法を定めるものです。関連する関数としてみると、上の「パターン２」にあたります。
+`MyBox`に対して`Deref`トレイトを実装する例では、`&MyBox<T>`から、その中身の型への参照`&T`への変換を記述してます。
