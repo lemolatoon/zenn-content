@@ -305,3 +305,47 @@ let a: Box<dyn Draw> = Box::new(A(1)); // OK
 let b: Box<dyn Draw> = Box::new(B(1)); // OK
 ```
 つまり、`Box<A>`型は`Box<dyn Draw>`型になれるし、`Box<B>`型は`Box<dyn Draw>`型になることができます。
+
+## ダイナミックディスパッチとは
+ダイナミックディスパッチは、トレイトオブジェクト型で、トレイトの関数をcallするときに起こるもので、具体的には以下のようなシチュエーションで起こります。
+```rust
+pub trait Print {
+    fn print(&self);
+}
+pub struct A {
+    a: usize
+};
+pub struct B {
+    b: isize
+};
+
+impl Print for A {
+    fn print(&self) { // print関数①
+        println!("{}", self.a);
+    };
+}
+impl Print for B {
+    fn print(&self) { // print関数②
+       println!("{}", self.b);
+    };
+}
+
+use rand;
+fn main() {
+    let val: bool = rand::random::<bool>() // 5:5の確率で`true`, `false`を生成
+    let printable: Box<dyn Print> = if val {
+        Box::new(A {a: 1})
+    } else {
+        Box::new(B {b: -1})
+    };
+    printable.print();
+}
+```
+上の例では、50%の確率で構造体`A`が入っている`Box`、50%の確率で構造体`B`が入っている`Box`が、変数`printable`に代入されます。構造体`A`の`print`関数が呼ばれるか、構造体`B`の`print`関数が呼ばれるかは実行時にしかわかりません。つまり、実行するたびに結果が変わります。
+では、実際上どのようにして、２つの異なる`print`関数を呼び分けているのでしょうか。
+**vtable**というものを用いて実現しています。トレイトオブジェクト型の変数は、vtable（すべての代入されうるトレイトオブジェクトの元（もと）の型『ここでは`A`と`B`』のそれぞれの関数の場所『ここでは、`A`の`print`関数①と`B`の`print`関数②のそれぞれの場所』の配列）を共有して持っています。
+また、トレイトオブジェクトは自分の元の型の該当する表のオフセット（配列と考えれば添字のこと）を持っています（元が構造体`A`だったならオフセット０, 元が構造体`B`だったならオフセット１など）。
+このように、
+1. vtableの場所
+2. vtable上の自分のトレイト関数の実装を示すオフセット
+の２つの情報をトレイトオブジェクトは持つことで、実行時の動的な呼び分けを実現しています。また、このような関数の呼び分け方法を「ダイナミックディスパッチ」と呼びます。
