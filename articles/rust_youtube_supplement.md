@@ -3,7 +3,7 @@ title: "Rust解説動画の補足資料"
 emoji: "📚"
 type: "tech" # tech: 技術記事 / idea: アイデア
 topics: ["Rust", "the_book"]
-published: false
+published: true
 ---
 
 ## この記事はなに？
