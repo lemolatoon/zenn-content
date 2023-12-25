@@ -288,9 +288,9 @@ pm.addPass(mlir::createInlinerPass());
 
 `mlir::createInlinerPass`のように、MLIR が標準で持っているパスがたくさんあります。
 
-:::details sample1.toy をインライン化した結果:sample2.toy
+:::details sample1.mlir をインライン化した結果:sample2.mlir
 
-```toy:sample2.toy
+```toy:sample2.mlir
 module {
   toy.func @main() {
     %0 = "toy.constant"() {value = dense<[[1.000000e+00, 2.000000e+00, 3.000000e+00], [4.000000e+00, 5.000000e+00, 6.000000e+00]]> : tensor<2x3xf64>} : () -> tensor<2x3xf64>
@@ -455,9 +455,9 @@ struct BinaryOpLowering : public mlir::ConversionPattern {
 pm.addPass(toy::createLowerToAffinePass());
 ```
 
-:::details sample2.toy に ToyToAffineLoweringPass を適用した MLIR:sample3.toy
+:::details sample2.mlir に ToyToAffineLoweringPass を適用した MLIR:sample3.mlir
 
-```toy:sample3.toy
+```toy:sample3.mlir
 module {
   func.func @main() {
     %cst = arith.constant 6.000000e+00 : f64
@@ -523,9 +523,9 @@ optPM.addPass(mlir::createLoopFusionPass());
 optPM.addPass(mlir::createAffineScalarReplacementPass());
 ```
 
-:::details sample3.toy に Affine Dialect の最適化パスを適用した MLIR:sample4.toy
+:::details sample3.mlir に Affine Dialect の最適化パスを適用した MLIR:sample4.mlir
 
-```toy:sample4.toy
+```toy:sample4.mlir
 module {
   func.func @main() {
     %cst = arith.constant 6.000000e+00 : f64
@@ -558,6 +558,287 @@ module {
 }
 ```
 
+:::
+
 複数あった`affine.for`が一つにまとまり、かなりスッキリしました。
 
+### LLVM Dialect への lowering
+
+最後に、LLVM IR まで lowering します。MLIR には、LLVM IR を表すための 'llvm' Dialect^[https://mlir.llvm.org/docs/Dialects/LLVM/]が存在します。このような最終的なターゲットとなるような Dialect のことを Output Dialects と呼ぶようです。^[https://youtu.be/hIt6J1_E21c?si=3OETX62vxNE92M1R&t=1383]
+
+ここでの戦略を図に表します。^[[Index Dialect](https://mlir.llvm.org/docs/Dialects/IndexOps/)は、`affine.for`のループの下限や上限を表すのに用いている。]
+
+```mermaid
+graph TD;
+
+A["AST(not dialect)"] --> B[Toy]
+B --> C[Affine]
+B --> D[Arith]
+B --> E[Memref]
+B --> F[Index]
+B --> I[Func]
+C ==> G[SCF]
+G ==> H[CF]
+H ==> L[LLVM]
+D ==> L
+E ==> L
+F ==> L
+I ==> L
+B ==> |PrintOp のみ| G2[SCFなど]
+G2 ==> L
+```
+
+この図において、太字で表す部分を`ToyToLLVMLoweringPass`というパスとして定義することにします。一見大変そうですが、Memref Dialect から LLVM Dialect といった、MLIR 標準の Dialect 間の変換は既にコミュニティによって実装されています。
+よって、自分たちで実装しなければならないのは、Toy Dialect から LLVM Dialect への変換、特に`PrintOp`から LLVM Dialect への変換のみになります。
+
+LLVM Dialect への変換とは言っても、一気に LLVM Dialect まで lowering する必要はありません。「LLVM Dialect への変換が実装されている Dialect」へ変換すれば良いことになります。
+
+Tensor の stdio への出力にはループが必要ですが、LLVM 流のラベルを付けたりしてループをするのは大変なので、ループを抽象化した、`scf.for`などの命令がある SCF Dialect^[https://mlir.llvm.org/docs/Dialects/SCFDialect/]などを経由します。
+
+詳細な実装については書きませんが、これによって、Toy 言語を LLVM Dialect のみで表すことができたことになります。
+:::details sample4.mlir に `ToyToLLVMLoweringPass` を適用した MLIR(かなり長い):sample5.mlir
+
+```toy:sample5.mlir
+module {
+  llvm.func @free(!llvm.ptr<i8>)
+  llvm.mlir.global internal constant @newLine("\0A\00") {addr_space = 0 : i32}
+  llvm.mlir.global internal constant @formatSpecifier("%f \00") {addr_space = 0 : i32}
+  llvm.func @printf(!llvm.ptr, ...) -> i32
+  llvm.func @malloc(i64) -> !llvm.ptr<i8>
+  llvm.func @main() {
+    %0 = llvm.mlir.constant(6.000000e+00 : f64) : f64
+    %1 = llvm.mlir.constant(5.000000e+00 : f64) : f64
+    %2 = llvm.mlir.constant(4.000000e+00 : f64) : f64
+    %3 = llvm.mlir.constant(3.000000e+00 : f64) : f64
+    %4 = llvm.mlir.constant(2.000000e+00 : f64) : f64
+    %5 = llvm.mlir.constant(1.000000e+00 : f64) : f64
+    %6 = llvm.mlir.constant(2 : index) : i64
+    %7 = llvm.mlir.constant(3 : index) : i64
+    %8 = llvm.mlir.constant(1 : index) : i64
+    %9 = llvm.mlir.constant(6 : index) : i64
+    %10 = llvm.mlir.null : !llvm.ptr<f64>
+    %11 = llvm.getelementptr %10[%9] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    %12 = llvm.ptrtoint %11 : !llvm.ptr<f64> to i64
+    %13 = llvm.call @malloc(%12) : (i64) -> !llvm.ptr<i8>
+    %14 = llvm.bitcast %13 : !llvm.ptr<i8> to !llvm.ptr<f64>
+    %15 = llvm.mlir.undef : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %16 = llvm.insertvalue %14, %15[0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %17 = llvm.insertvalue %14, %16[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %18 = llvm.mlir.constant(0 : index) : i64
+    %19 = llvm.insertvalue %18, %17[2] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %20 = llvm.insertvalue %6, %19[3, 0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %21 = llvm.insertvalue %7, %20[3, 1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %22 = llvm.insertvalue %7, %21[4, 0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %23 = llvm.insertvalue %8, %22[4, 1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %24 = llvm.mlir.constant(2 : index) : i64
+    %25 = llvm.mlir.constant(3 : index) : i64
+    %26 = llvm.mlir.constant(1 : index) : i64
+    %27 = llvm.mlir.constant(6 : index) : i64
+    %28 = llvm.mlir.null : !llvm.ptr<f64>
+    %29 = llvm.getelementptr %28[%27] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    %30 = llvm.ptrtoint %29 : !llvm.ptr<f64> to i64
+    %31 = llvm.call @malloc(%30) : (i64) -> !llvm.ptr<i8>
+    %32 = llvm.bitcast %31 : !llvm.ptr<i8> to !llvm.ptr<f64>
+    %33 = llvm.mlir.undef : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %34 = llvm.insertvalue %32, %33[0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %35 = llvm.insertvalue %32, %34[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %36 = llvm.mlir.constant(0 : index) : i64
+    %37 = llvm.insertvalue %36, %35[2] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %38 = llvm.insertvalue %24, %37[3, 0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %39 = llvm.insertvalue %25, %38[3, 1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %40 = llvm.insertvalue %25, %39[4, 0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %41 = llvm.insertvalue %26, %40[4, 1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %42 = llvm.mlir.constant(0 : index) : i64
+    %43 = llvm.mlir.constant(0 : index) : i64
+    %44 = llvm.extractvalue %41[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %45 = llvm.mlir.constant(3 : index) : i64
+    %46 = llvm.mul %42, %45  : i64
+    %47 = llvm.add %46, %43  : i64
+    %48 = llvm.getelementptr %44[%47] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %5, %48 : !llvm.ptr<f64>
+    %49 = llvm.mlir.constant(0 : index) : i64
+    %50 = llvm.mlir.constant(1 : index) : i64
+    %51 = llvm.extractvalue %41[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %52 = llvm.mlir.constant(3 : index) : i64
+    %53 = llvm.mul %49, %52  : i64
+    %54 = llvm.add %53, %50  : i64
+    %55 = llvm.getelementptr %51[%54] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %4, %55 : !llvm.ptr<f64>
+    %56 = llvm.mlir.constant(0 : index) : i64
+    %57 = llvm.mlir.constant(2 : index) : i64
+    %58 = llvm.extractvalue %41[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %59 = llvm.mlir.constant(3 : index) : i64
+    %60 = llvm.mul %56, %59  : i64
+    %61 = llvm.add %60, %57  : i64
+    %62 = llvm.getelementptr %58[%61] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %3, %62 : !llvm.ptr<f64>
+    %63 = llvm.mlir.constant(1 : index) : i64
+    %64 = llvm.mlir.constant(0 : index) : i64
+    %65 = llvm.extractvalue %41[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %66 = llvm.mlir.constant(3 : index) : i64
+    %67 = llvm.mul %63, %66  : i64
+    %68 = llvm.add %67, %64  : i64
+    %69 = llvm.getelementptr %65[%68] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %2, %69 : !llvm.ptr<f64>
+    %70 = llvm.mlir.constant(1 : index) : i64
+    %71 = llvm.mlir.constant(1 : index) : i64
+    %72 = llvm.extractvalue %41[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %73 = llvm.mlir.constant(3 : index) : i64
+    %74 = llvm.mul %70, %73  : i64
+    %75 = llvm.add %74, %71  : i64
+    %76 = llvm.getelementptr %72[%75] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %1, %76 : !llvm.ptr<f64>
+    %77 = llvm.mlir.constant(1 : index) : i64
+    %78 = llvm.mlir.constant(2 : index) : i64
+    %79 = llvm.extractvalue %41[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %80 = llvm.mlir.constant(3 : index) : i64
+    %81 = llvm.mul %77, %80  : i64
+    %82 = llvm.add %81, %78  : i64
+    %83 = llvm.getelementptr %79[%82] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %0, %83 : !llvm.ptr<f64>
+    %84 = llvm.mlir.constant(0 : index) : i64
+    %85 = llvm.mlir.constant(2 : index) : i64
+    %86 = llvm.mlir.constant(1 : index) : i64
+    llvm.br ^bb1(%84 : i64)
+  ^bb1(%87: i64):  // 2 preds: ^bb0, ^bb5
+    %88 = llvm.icmp "slt" %87, %85 : i64
+    llvm.cond_br %88, ^bb2, ^bb6
+  ^bb2:  // pred: ^bb1
+    %89 = llvm.mlir.constant(0 : index) : i64
+    %90 = llvm.mlir.constant(3 : index) : i64
+    %91 = llvm.mlir.constant(1 : index) : i64
+    llvm.br ^bb3(%89 : i64)
+  ^bb3(%92: i64):  // 2 preds: ^bb2, ^bb4
+    %93 = llvm.icmp "slt" %92, %90 : i64
+    llvm.cond_br %93, ^bb4, ^bb5
+  ^bb4:  // pred: ^bb3
+    %94 = llvm.extractvalue %41[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %95 = llvm.mlir.constant(3 : index) : i64
+    %96 = llvm.mul %87, %95  : i64
+    %97 = llvm.add %96, %92  : i64
+    %98 = llvm.getelementptr %94[%97] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    %99 = llvm.load %98 : !llvm.ptr<f64>
+    %100 = llvm.fmul %99, %99  : f64
+    %101 = llvm.fmul %100, %100  : f64
+    %102 = llvm.extractvalue %23[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %103 = llvm.mlir.constant(3 : index) : i64
+    %104 = llvm.mul %87, %103  : i64
+    %105 = llvm.add %104, %92  : i64
+    %106 = llvm.getelementptr %102[%105] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %101, %106 : !llvm.ptr<f64>
+    %107 = llvm.add %92, %91  : i64
+    llvm.br ^bb3(%107 : i64)
+  ^bb5:  // pred: ^bb3
+    %108 = llvm.add %87, %86  : i64
+    llvm.br ^bb1(%108 : i64)
+  ^bb6:  // pred: ^bb1
+    %109 = llvm.mlir.addressof @formatSpecifier : !llvm.ptr<array<4 x i8>>
+    %110 = llvm.mlir.constant(0 : index) : i64
+    %111 = llvm.getelementptr %109[%110, %110] : (!llvm.ptr<array<4 x i8>>, i64, i64) -> !llvm.ptr, i8
+    %112 = llvm.mlir.addressof @newLine : !llvm.ptr<array<2 x i8>>
+    %113 = llvm.mlir.constant(0 : index) : i64
+    %114 = llvm.getelementptr %112[%113, %113] : (!llvm.ptr<array<2 x i8>>, i64, i64) -> !llvm.ptr, i8
+    %115 = llvm.mlir.constant(0 : index) : i64
+    %116 = llvm.mlir.constant(2 : index) : i64
+    %117 = llvm.mlir.constant(1 : index) : i64
+    llvm.br ^bb7(%115 : i64)
+  ^bb7(%118: i64):  // 2 preds: ^bb6, ^bb11
+    %119 = llvm.icmp "slt" %118, %116 : i64
+    llvm.cond_br %119, ^bb8, ^bb12
+  ^bb8:  // pred: ^bb7
+    %120 = llvm.mlir.constant(0 : index) : i64
+    %121 = llvm.mlir.constant(3 : index) : i64
+    %122 = llvm.mlir.constant(1 : index) : i64
+    llvm.br ^bb9(%120 : i64)
+  ^bb9(%123: i64):  // 2 preds: ^bb8, ^bb10
+    %124 = llvm.icmp "slt" %123, %121 : i64
+    llvm.cond_br %124, ^bb10, ^bb11
+  ^bb10:  // pred: ^bb9
+    %125 = llvm.extractvalue %23[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %126 = llvm.mlir.constant(3 : index) : i64
+    %127 = llvm.mul %118, %126  : i64
+    %128 = llvm.add %127, %123  : i64
+    %129 = llvm.getelementptr %125[%128] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    %130 = llvm.load %129 : !llvm.ptr<f64>
+    %131 = llvm.call @printf(%111, %130) : (!llvm.ptr, f64) -> i32
+    %132 = llvm.add %123, %122  : i64
+    llvm.br ^bb9(%132 : i64)
+  ^bb11:  // pred: ^bb9
+    %133 = llvm.call @printf(%114) : (!llvm.ptr) -> i32
+    %134 = llvm.add %118, %117  : i64
+    llvm.br ^bb7(%134 : i64)
+  ^bb12:  // pred: ^bb7
+    %135 = llvm.extractvalue %41[0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %136 = llvm.bitcast %135 : !llvm.ptr<f64> to !llvm.ptr<i8>
+    llvm.call @free(%136) : (!llvm.ptr<i8>) -> ()
+    %137 = llvm.extractvalue %23[0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %138 = llvm.bitcast %137 : !llvm.ptr<f64> to !llvm.ptr<i8>
+    llvm.call @free(%138) : (!llvm.ptr<i8>) -> ()
+    llvm.return
+  }
+}
+```
+
 :::
+
+LLVM Dialect のみで表された MLIR は LLVM IR へと変換することができます。あとは、LLVM の巨大な資産を使って、特定のプロセッサーの機械語向けにコンパイルしたり、JIT で実行したり色々することができます。
+
+:::details LLVM Dialect のみの sample5.mlir を LLVM IR に変換した結果:sample6.ir
+LLVM 大先生のちからでなんと、定数までたたみこまれています。
+
+```llvm:sample6.ir
+; ModuleID = 'LLVMDialectModule'
+source_filename = "LLVMDialectModule"
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-pc-linux-gnu"
+
+@formatSpecifier = internal constant [4 x i8] c"%f \00"
+
+; Function Attrs: nofree nounwind
+declare noundef i32 @printf(ptr nocapture noundef readonly, ...) local_unnamed_addr #0
+
+; Function Attrs: nounwind
+define void @main() local_unnamed_addr #1 {
+.preheader3:
+  %0 = tail call i32 (ptr, ...) @printf(ptr nonnull dereferenceable(1) @formatSpecifier, double 1.000000e+00)
+  %1 = tail call i32 (ptr, ...) @printf(ptr nonnull dereferenceable(1) @formatSpecifier, double 1.600000e+01)
+  %2 = tail call i32 (ptr, ...) @printf(ptr nonnull dereferenceable(1) @formatSpecifier, double 8.100000e+01)
+  %putchar = tail call i32 @putchar(i32 10)
+  %3 = tail call i32 (ptr, ...) @printf(ptr nonnull dereferenceable(1) @formatSpecifier, double 2.560000e+02)
+  %4 = tail call i32 (ptr, ...) @printf(ptr nonnull dereferenceable(1) @formatSpecifier, double 6.250000e+02)
+  %5 = tail call i32 (ptr, ...) @printf(ptr nonnull dereferenceable(1) @formatSpecifier, double 1.296000e+03)
+  %putchar.1 = tail call i32 @putchar(i32 10)
+  ret void
+}
+
+; Function Attrs: nofree nounwind
+declare noundef i32 @putchar(i32 noundef) local_unnamed_addr #0
+
+attributes #0 = { nofree nounwind }
+attributes #1 = { nounwind }
+
+!llvm.module.flags = !{!0}
+
+!0 = !{i32 2, !"Debug Info Version", i32 3}
+```
+
+:::
+
+```bash
+$ lli sample6.ir
+1.000000 16.000000 81.000000
+256.000000 625.000000 1296.000000
+```
+
+### MLIR の良さ
+
+ここまでで、自作言語を MLIR を使って LLVM IR まで変換するところを見ました。MLIR の基盤に載ってしまえば、整備されたインライン化の仕組みや、
+複数の Dialect(中間表現)を組み合わせて、最終的な Output Dialect まで簡単に lowering していけることが分かったのではないかなと思います。
+
+また、Affine Dialect での最適化のように、少しずつ意味のレベルを落としていくことで、そのレベルでの最大の最適化をすることができ、最適化のしやすさ、資産の共有のしやすさの観点からも MLIR は良いと思います。
+
+## Toy 言語を GPU 上で動かす
+
+ここまでは、[Toy Tutorial](https://mlir.llvm.org/docs/Tutorials/Toy/)にある内容でしたが、ここからは独自にやっている部分です。
+
+### GPU Dialect
