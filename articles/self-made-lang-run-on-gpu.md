@@ -6,7 +6,7 @@ topics: ["MLIR", "LLVM", "GPU", "compiler"]
 published: true
 ---
 
-この記事は、KCS アドベントカレンダー 23 日目の記事です。
+この記事は、[KCS アドベントカレンダー](https://qiita.com/advent-calendar/2023/kcs) 23 日目の記事です。
 
 22 日目・24 日目
 
