@@ -564,7 +564,7 @@ module {
 
 ### LLVM Dialect への lowering
 
-最後に、LLVM IR まで lowering します。MLIR には、LLVM IR を表すための 'llvm' Dialect^[https://mlir.llvm.org/docs/Dialects/LLVM/]が存在します。このような最終的なターゲットとなるような Dialect のことを Output Dialects と呼ぶようです。^[https://youtu.be/hIt6J1_E21c?si=3OETX62vxNE92M1R&t=1383]
+最後に、LLVM IR まで lowering します。MLIR には、LLVM IR を表すための 'llvm' Dialect^[https://mlir.llvm.org/docs/Dialects/LLVM/]が存在します。このような最終的なターゲットとなるような Dialect のことを Output Dialects と呼ぶようです。^[[この動画のこの部分](https://youtu.be/hIt6J1_E21c?si=3OETX62vxNE92M1R&t=1383)で説明されている。]
 
 ここでの戦略を図に表します。^[[Index Dialect](https://mlir.llvm.org/docs/Dialects/IndexOps/)は、`affine.for`のループの下限や上限を表すのに用いている。]
 
@@ -825,6 +825,7 @@ attributes #1 = { nounwind }
 :::
 
 ```bash
+# JITで実行する例
 $ lli sample6.ir
 1.000000 16.000000 81.000000
 256.000000 625.000000 1296.000000
@@ -839,6 +840,580 @@ $ lli sample6.ir
 
 ## Toy 言語を GPU 上で動かす
 
-ここまでは、[Toy Tutorial](https://mlir.llvm.org/docs/Tutorials/Toy/)にある内容でしたが、ここからは独自にやっている部分です。
+ここまでは、[Toy Tutorial](https://mlir.llvm.org/docs/Tutorials/Toy/)にある内容でしたが、ここからは独自にやっている部分です。Toy 言語を LLVM IR に変換するという点では同じですが、Tensor 同士の演算によるループは、要素ごとに独立であり、並列に計算できそうであるので、これを GPU の上で走らせることを考えます。
 
 ### GPU Dialect
+
+MLIR には標準 Dialect の１つとして、[GPU Dialect](https://mlir.llvm.org/docs/Dialects/GPU/)があります。
+
+GPU Dialect は、CUDA や OpenCL といった GPU カーネルのプログラミングモデルを抽象化したような命令を提供する Dialect です。
+この Dialect では、GPU カーネル自体を記述できる他、カーネルとホスト間のメモリーコピーや、カーネルの立ち上げ、などのホスト側^[GPU と CPU なら、CPU 側のこと]の記述もできるようになっています。
+
+GPU Dialect からは、カーネル部分を NVIDIA GPU 用のバイナリである[cubin](https://docs.nvidia.com/cuda/cuda-binary-utilities/index.html#what-is-a-cuda-binary)に変換したり、AMD の GPU 上で実行することができるバイナリである[hsaco](https://gpuopen.com/learn/amdgcn-assembly/)^[自分もあまりまだ分かってない]に変換したりすることができます。
+また、ホスト側のコードも、LLVM Dialect に落とすことができます。^[おそらく内部で CUDA の API を読んだりすることになる]
+また、OpenCL のカーネルの中間表現である SPIRV Dialect に落とすこともできるようです。^[未検証: https://mlir.llvm.org/doxygen/GPUToSPIRVPass_8cpp_source.html]
+
+このように、様々な Output の候補がある中で、抽象化して様々なパスを集約する役割がある Dialect を Hourglass Dialect と呼ぶようです。^[[この動画のこの部分](https://youtu.be/hIt6J1_E21c?si=qbvoZc0_cH8M5f6S&t=956)でそう呼ばれている。]
+
+### Lowering 戦略
+
+LLVM Dialect に lowering したときの図を再掲します。
+
+```mermaid
+graph TD;
+
+A["AST(not dialect)"] --> B[Toy]
+B --> C[Affine]
+B --> D[Arith]
+B --> E[Memref]
+B --> F[Index]
+B --> I[Func]
+C ==> G[SCF]
+G ==> H[CF]
+H ==> L[LLVM]
+D ==> L
+E ==> L
+F ==> L
+I ==> L
+B ==> |PrintOp のみ| G2[SCFなど]
+G2 ==> L
+```
+
+現在自分がやろうとしているのは次のような lowering 戦略になります。
+
+```mermaid
+graph TD;
+
+A["AST(not dialect)"] --> Toy[Toy]
+Toy --> Affine[Affine]
+Toy --> Arith[Arith]
+Toy --> Memref[Memref]
+Toy --> Index[Index]
+Toy --> Func[Func]
+
+Affine --> |LoopFusionPass| Affine
+Affine --> |AffineParallelizePass| SCF
+Arith --> LLVM[LLVM]
+Toy --> |PrintOp| LLVM
+Memref --> LLVM
+SCF --> |GpuMapParallelLoopsPass| SCF
+SCF --> |ParallelLoopToGpuPass| GPU
+SCF --> |ParallelLoopToGpuPass| Builtin["builtin.unrealized_conversion_cast"]
+Builtin --> |"ReplaceWithIndexCastsPass(自作)"| Index
+GPU --> |"kernel:GpuKernelOutliningPass"| GPU
+GPU --> |"kernel:LowerGpuOpsToNVVMOpsPass"| NVVM
+GPU --> |"kernel:GpuSerializeToCubinPass"| Cubin
+NVVM --> |"kernel:GpuSerializeToCubinPass"| Cubin
+Index --> LLVM
+Func --> LLVM
+GPU --> |"host:GpuToLLVMConversionPass"| LLVM
+```
+
+`(自作)`とつけてある、`ReplaceWithIndexCastsPass`や、Toy Dialect からの Lowering 以外は、ほぼすべて標準が用意してくれたパスを使用しています。中間表現やその変換の実装を共有するという MLIR の良さがよく分かります。
+
+実際の for 文がどのようにして、gpu 向けに変換されるのかを見てみましょう。各 MLIR が長いので、アコーディオンにしています。
+
+:::details 元の Affine Dialect による for 文
+
+```mlir
+module {
+  func.func @main() {
+    %cst = arith.constant 6.000000e+00 : f64
+    %cst_0 = arith.constant 5.000000e+00 : f64
+    %cst_1 = arith.constant 4.000000e+00 : f64
+    %cst_2 = arith.constant 3.000000e+00 : f64
+    %cst_3 = arith.constant 2.000000e+00 : f64
+    %cst_4 = arith.constant 1.000000e+00 : f64
+    %alloc = memref.alloc() : memref<2x3xf64>
+    %alloc_5 = memref.alloc() : memref<2x3xf64>
+    affine.store %cst_4, %alloc_5[0, 0] : memref<2x3xf64>
+    affine.store %cst_3, %alloc_5[0, 1] : memref<2x3xf64>
+    affine.store %cst_2, %alloc_5[0, 2] : memref<2x3xf64>
+    affine.store %cst_1, %alloc_5[1, 0] : memref<2x3xf64>
+    affine.store %cst_0, %alloc_5[1, 1] : memref<2x3xf64>
+    affine.store %cst, %alloc_5[1, 2] : memref<2x3xf64>
+    affine.for %arg0 = 0 to 2 {
+      affine.for %arg1 = 0 to 3 {
+        %0 = affine.load %alloc_5[%arg0, %arg1] : memref<2x3xf64>
+        %1 = arith.mulf %0, %0 : f64
+        %2 = arith.mulf %1, %1 : f64
+        affine.store %2, %alloc[%arg0, %arg1] : memref<2x3xf64>
+      }
+    }
+    toy.print %alloc : memref<2x3xf64>
+    memref.dealloc %alloc_5 : memref<2x3xf64>
+    memref.dealloc %alloc : memref<2x3xf64>
+    return
+  }
+}
+```
+
+:::
+
+GPU カーネル側に、llvm 以外の Dialect が混ざると lowering がめんどくさくなってしまうので、GPU Dialect に変換する前に極力 LLVM Dialect に lowering するようにします。
+:::details Affine Dialect に、AffineParallelizePass と、GpuMapPrallelLoopsPass をかけたもの
+
+```mlir
+module {
+  llvm.func @free(!llvm.ptr<i8>)
+  llvm.func @malloc(i64) -> !llvm.ptr<i8>
+  llvm.mlir.global internal constant @newLine("\0A\00") {addr_space = 0 : i32}
+  llvm.mlir.global internal constant @formatSpecifier("%f \00") {addr_space = 0 : i32}
+  llvm.func @printf(!llvm.ptr, ...) -> i32
+  func.func @main() {
+    %0 = llvm.mlir.constant(6.000000e+00 : f64) : f64
+    %1 = llvm.mlir.constant(5.000000e+00 : f64) : f64
+    %2 = llvm.mlir.constant(4.000000e+00 : f64) : f64
+    %3 = llvm.mlir.constant(3.000000e+00 : f64) : f64
+    %4 = llvm.mlir.constant(2.000000e+00 : f64) : f64
+    %5 = llvm.mlir.constant(1.000000e+00 : f64) : f64
+    %6 = llvm.mlir.constant(2 : index) : i64
+    %7 = llvm.mlir.constant(3 : index) : i64
+    %8 = llvm.mlir.constant(1 : index) : i64
+    %9 = llvm.mlir.constant(6 : index) : i64
+    %10 = llvm.mlir.null : !llvm.ptr<f64>
+    %11 = llvm.getelementptr %10[6] : (!llvm.ptr<f64>) -> !llvm.ptr<f64>
+    %12 = llvm.ptrtoint %11 : !llvm.ptr<f64> to i64
+    %13 = llvm.call @malloc(%12) : (i64) -> !llvm.ptr<i8>
+    %14 = llvm.bitcast %13 : !llvm.ptr<i8> to !llvm.ptr<f64>
+    %15 = llvm.mlir.undef : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %16 = llvm.insertvalue %14, %15[0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %17 = llvm.insertvalue %14, %16[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %18 = llvm.mlir.constant(0 : index) : i64
+    %19 = llvm.insertvalue %18, %17[2] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %20 = llvm.insertvalue %6, %19[3, 0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %21 = llvm.insertvalue %7, %20[3, 1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %22 = llvm.insertvalue %7, %21[4, 0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %23 = llvm.insertvalue %8, %22[4, 1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %24 = builtin.unrealized_conversion_cast %23 : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)> to memref<2x3xf64>
+    %25 = llvm.mlir.constant(2 : index) : i64
+    %26 = llvm.mlir.constant(3 : index) : i64
+    %27 = llvm.mlir.constant(1 : index) : i64
+    %28 = llvm.mlir.constant(6 : index) : i64
+    %29 = llvm.mlir.null : !llvm.ptr<f64>
+    %30 = llvm.getelementptr %29[6] : (!llvm.ptr<f64>) -> !llvm.ptr<f64>
+    %31 = llvm.ptrtoint %30 : !llvm.ptr<f64> to i64
+    %32 = llvm.call @malloc(%31) : (i64) -> !llvm.ptr<i8>
+    %33 = llvm.bitcast %32 : !llvm.ptr<i8> to !llvm.ptr<f64>
+    %34 = llvm.mlir.undef : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %35 = llvm.insertvalue %33, %34[0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %36 = llvm.insertvalue %33, %35[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %37 = llvm.mlir.constant(0 : index) : i64
+    %38 = llvm.insertvalue %37, %36[2] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %39 = llvm.insertvalue %25, %38[3, 0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %40 = llvm.insertvalue %26, %39[3, 1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %41 = llvm.insertvalue %26, %40[4, 0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %42 = llvm.insertvalue %27, %41[4, 1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %43 = builtin.unrealized_conversion_cast %42 : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)> to memref<2x3xf64>
+    %44 = llvm.mlir.constant(0 : index) : i64
+    %45 = builtin.unrealized_conversion_cast %44 : i64 to index
+    %46 = llvm.mlir.constant(0 : index) : i64
+    %47 = builtin.unrealized_conversion_cast %46 : i64 to index
+    %48 = llvm.extractvalue %42[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %49 = llvm.mlir.constant(3 : index) : i64
+    %50 = llvm.mul %44, %49  : i64
+    %51 = llvm.add %50, %46  : i64
+    %52 = llvm.getelementptr %48[%51] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %5, %52 : !llvm.ptr<f64>
+    %53 = llvm.mlir.constant(0 : index) : i64
+    %54 = builtin.unrealized_conversion_cast %53 : i64 to index
+    %55 = llvm.mlir.constant(1 : index) : i64
+    %56 = builtin.unrealized_conversion_cast %55 : i64 to index
+    %57 = llvm.extractvalue %42[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %58 = llvm.mlir.constant(3 : index) : i64
+    %59 = llvm.mul %53, %58  : i64
+    %60 = llvm.add %59, %55  : i64
+    %61 = llvm.getelementptr %57[%60] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %4, %61 : !llvm.ptr<f64>
+    %62 = llvm.mlir.constant(0 : index) : i64
+    %63 = builtin.unrealized_conversion_cast %62 : i64 to index
+    %64 = llvm.mlir.constant(2 : index) : i64
+    %65 = builtin.unrealized_conversion_cast %64 : i64 to index
+    %66 = llvm.extractvalue %42[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %67 = llvm.mlir.constant(3 : index) : i64
+    %68 = llvm.mul %62, %67  : i64
+    %69 = llvm.add %68, %64  : i64
+    %70 = llvm.getelementptr %66[%69] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %3, %70 : !llvm.ptr<f64>
+    %71 = llvm.mlir.constant(1 : index) : i64
+    %72 = builtin.unrealized_conversion_cast %71 : i64 to index
+    %73 = llvm.mlir.constant(0 : index) : i64
+    %74 = builtin.unrealized_conversion_cast %73 : i64 to index
+    %75 = llvm.extractvalue %42[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %76 = llvm.mlir.constant(3 : index) : i64
+    %77 = llvm.mul %71, %76  : i64
+    %78 = llvm.add %77, %73  : i64
+    %79 = llvm.getelementptr %75[%78] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %2, %79 : !llvm.ptr<f64>
+    %80 = llvm.mlir.constant(1 : index) : i64
+    %81 = builtin.unrealized_conversion_cast %80 : i64 to index
+    %82 = llvm.mlir.constant(1 : index) : i64
+    %83 = builtin.unrealized_conversion_cast %82 : i64 to index
+    %84 = llvm.extractvalue %42[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %85 = llvm.mlir.constant(3 : index) : i64
+    %86 = llvm.mul %80, %85  : i64
+    %87 = llvm.add %86, %82  : i64
+    %88 = llvm.getelementptr %84[%87] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %1, %88 : !llvm.ptr<f64>
+    %89 = llvm.mlir.constant(1 : index) : i64
+    %90 = builtin.unrealized_conversion_cast %89 : i64 to index
+    %91 = llvm.mlir.constant(2 : index) : i64
+    %92 = builtin.unrealized_conversion_cast %91 : i64 to index
+    %93 = llvm.extractvalue %42[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %94 = llvm.mlir.constant(3 : index) : i64
+    %95 = llvm.mul %89, %94  : i64
+    %96 = llvm.add %95, %91  : i64
+    %97 = llvm.getelementptr %93[%96] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %0, %97 : !llvm.ptr<f64>
+    %98 = llvm.mlir.constant(0 : index) : i64
+    %99 = builtin.unrealized_conversion_cast %98 : i64 to index
+    %100 = llvm.mlir.constant(2 : index) : i64
+    %101 = builtin.unrealized_conversion_cast %100 : i64 to index
+    %102 = llvm.mlir.constant(1 : index) : i64
+    %103 = builtin.unrealized_conversion_cast %102 : i64 to index
+    scf.parallel (%arg0) = (%99) to (%101) step (%103) {
+      %118 = builtin.unrealized_conversion_cast %arg0 : index to i64
+      %119 = llvm.mlir.constant(0 : index) : i64
+      %120 = builtin.unrealized_conversion_cast %119 : i64 to index
+      %121 = llvm.mlir.constant(3 : index) : i64
+      %122 = builtin.unrealized_conversion_cast %121 : i64 to index
+      %123 = llvm.mlir.constant(1 : index) : i64
+      %124 = builtin.unrealized_conversion_cast %123 : i64 to index
+      scf.parallel (%arg1) = (%120) to (%122) step (%124) {
+        %125 = builtin.unrealized_conversion_cast %arg1 : index to i64
+        %126 = llvm.extractvalue %42[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+        %127 = llvm.mlir.constant(3 : index) : i64
+        %128 = llvm.mul %118, %127  : i64
+        %129 = llvm.add %128, %125  : i64
+        %130 = llvm.getelementptr %126[%129] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+        %131 = llvm.load %130 : !llvm.ptr<f64>
+        %132 = llvm.fmul %131, %131  : f64
+        %133 = llvm.fmul %132, %132  : f64
+        %134 = llvm.extractvalue %23[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+        %135 = llvm.mlir.constant(3 : index) : i64
+        %136 = llvm.mul %118, %135  : i64
+        %137 = llvm.add %136, %125  : i64
+        %138 = llvm.getelementptr %134[%137] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+        llvm.store %133, %138 : !llvm.ptr<f64>
+        scf.yield
+      } {mapping = [#gpu.loop_dim_map<processor = thread_x, map = (d0) -> (d0), bound = (d0) -> (d0)>]}
+      scf.yield
+    } {mapping = [#gpu.loop_dim_map<processor = block_x, map = (d0) -> (d0), bound = (d0) -> (d0)>]}
+    %104 = llvm.mlir.addressof @formatSpecifier : !llvm.ptr<array<4 x i8>>
+    %105 = llvm.mlir.constant(0 : index) : i64
+    %106 = llvm.getelementptr %104[0, 0] : (!llvm.ptr<array<4 x i8>>) -> !llvm.ptr, i8
+    %107 = llvm.mlir.addressof @newLine : !llvm.ptr<array<2 x i8>>
+    %108 = llvm.mlir.constant(0 : index) : i64
+    %109 = llvm.getelementptr %107[0, 0] : (!llvm.ptr<array<2 x i8>>) -> !llvm.ptr, i8
+    %110 = llvm.mlir.constant(0 : index) : i64
+    %111 = builtin.unrealized_conversion_cast %110 : i64 to index
+    %112 = llvm.mlir.constant(2 : index) : i64
+    %113 = builtin.unrealized_conversion_cast %112 : i64 to index
+    %114 = llvm.mlir.constant(1 : index) : i64
+    %115 = builtin.unrealized_conversion_cast %114 : i64 to index
+    scf.for %arg0 = %111 to %113 step %115 {
+      %118 = builtin.unrealized_conversion_cast %arg0 : index to i64
+      %119 = llvm.mlir.constant(0 : index) : i64
+      %120 = builtin.unrealized_conversion_cast %119 : i64 to index
+      %121 = llvm.mlir.constant(3 : index) : i64
+      %122 = builtin.unrealized_conversion_cast %121 : i64 to index
+      %123 = llvm.mlir.constant(1 : index) : i64
+      %124 = builtin.unrealized_conversion_cast %123 : i64 to index
+      scf.for %arg1 = %120 to %122 step %124 {
+        %126 = builtin.unrealized_conversion_cast %arg1 : index to i64
+        %127 = llvm.mlir.constant(3 : index) : i64
+        %128 = llvm.mul %118, %127  : i64
+        %129 = llvm.add %128, %126  : i64
+        %130 = llvm.getelementptr %14[%129] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+        %131 = llvm.load %130 : !llvm.ptr<f64>
+        %132 = llvm.call @printf(%106, %131) : (!llvm.ptr, f64) -> i32
+      }
+      %125 = llvm.call @printf(%109) : (!llvm.ptr) -> i32
+    }
+    %116 = llvm.bitcast %33 : !llvm.ptr<f64> to !llvm.ptr<i8>
+    llvm.call @free(%116) : (!llvm.ptr<i8>) -> ()
+    %117 = llvm.bitcast %14 : !llvm.ptr<f64> to !llvm.ptr<i8>
+    llvm.call @free(%117) : (!llvm.ptr<i8>) -> ()
+    return
+  }
+}
+
+```
+
+:::
+
+:::details GPU Dialect に変換し、Outlining したもの
+
+```mlir
+module attributes {gpu.container_module} {
+  llvm.func @free(!llvm.ptr<i8>)
+  llvm.func @malloc(i64) -> !llvm.ptr<i8>
+  llvm.mlir.global internal constant @newLine("\0A\00") {addr_space = 0 : i32}
+  llvm.mlir.global internal constant @formatSpecifier("%f \00") {addr_space = 0 : i32}
+  llvm.func @printf(!llvm.ptr, ...) -> i32
+  func.func @main() {
+    %0 = llvm.mlir.constant(1.000000e+00 : f64) : f64
+    %1 = llvm.mlir.constant(2.000000e+00 : f64) : f64
+    %2 = llvm.mlir.constant(3.000000e+00 : f64) : f64
+    %3 = llvm.mlir.constant(4.000000e+00 : f64) : f64
+    %4 = llvm.mlir.constant(5.000000e+00 : f64) : f64
+    %5 = llvm.mlir.constant(6.000000e+00 : f64) : f64
+    %6 = llvm.mlir.constant(0 : index) : i64
+    %7 = llvm.mlir.constant(1 : index) : i64
+    %8 = llvm.mlir.constant(2 : index) : i64
+    %9 = llvm.mlir.constant(3 : index) : i64
+    %10 = index.casts %9 : i64 to index
+    %11 = index.casts %8 : i64 to index
+    %12 = index.casts %7 : i64 to index
+    %13 = index.casts %6 : i64 to index
+    %14 = llvm.mlir.null : !llvm.ptr<f64>
+    %15 = llvm.getelementptr %14[6] : (!llvm.ptr<f64>) -> !llvm.ptr<f64>
+    %16 = llvm.ptrtoint %15 : !llvm.ptr<f64> to i64
+    %17 = llvm.call @malloc(%16) : (i64) -> !llvm.ptr<i8>
+    %18 = llvm.bitcast %17 : !llvm.ptr<i8> to !llvm.ptr<f64>
+    %19 = llvm.mlir.undef : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %20 = llvm.insertvalue %18, %19[0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %21 = llvm.insertvalue %18, %20[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %22 = llvm.insertvalue %6, %21[2] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %23 = llvm.insertvalue %8, %22[3, 0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %24 = llvm.insertvalue %9, %23[3, 1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %25 = llvm.insertvalue %9, %24[4, 0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %26 = llvm.insertvalue %7, %25[4, 1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %27 = llvm.mlir.null : !llvm.ptr<f64>
+    %28 = llvm.getelementptr %27[6] : (!llvm.ptr<f64>) -> !llvm.ptr<f64>
+    %29 = llvm.ptrtoint %28 : !llvm.ptr<f64> to i64
+    %30 = llvm.call @malloc(%29) : (i64) -> !llvm.ptr<i8>
+    %31 = llvm.bitcast %30 : !llvm.ptr<i8> to !llvm.ptr<f64>
+    %32 = llvm.mlir.undef : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %33 = llvm.insertvalue %31, %32[0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %34 = llvm.insertvalue %31, %33[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %35 = llvm.insertvalue %6, %34[2] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %36 = llvm.insertvalue %8, %35[3, 0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %37 = llvm.insertvalue %9, %36[3, 1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %38 = llvm.insertvalue %9, %37[4, 0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %39 = llvm.insertvalue %7, %38[4, 1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %40 = llvm.mul %6, %9  : i64
+    %41 = llvm.add %40, %6  : i64
+    %42 = llvm.getelementptr %31[%41] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %0, %42 : !llvm.ptr<f64>
+    %43 = llvm.mul %6, %9  : i64
+    %44 = llvm.add %43, %7  : i64
+    %45 = llvm.getelementptr %31[%44] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %1, %45 : !llvm.ptr<f64>
+    %46 = llvm.mul %6, %9  : i64
+    %47 = llvm.add %46, %8  : i64
+    %48 = llvm.getelementptr %31[%47] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %2, %48 : !llvm.ptr<f64>
+    %49 = llvm.mul %7, %9  : i64
+    %50 = llvm.add %49, %6  : i64
+    %51 = llvm.getelementptr %31[%50] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %3, %51 : !llvm.ptr<f64>
+    %52 = llvm.mul %7, %9  : i64
+    %53 = llvm.add %52, %7  : i64
+    %54 = llvm.getelementptr %31[%53] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %4, %54 : !llvm.ptr<f64>
+    %55 = llvm.mul %7, %9  : i64
+    %56 = llvm.add %55, %8  : i64
+    %57 = llvm.getelementptr %31[%56] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %5, %57 : !llvm.ptr<f64>
+    gpu.launch_func  @main_kernel::@main_kernel blocks in (%11, %12, %12) threads in (%10, %12, %12) args(%39 : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>, %26 : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>)
+    %58 = llvm.mlir.addressof @formatSpecifier : !llvm.ptr<array<4 x i8>>
+    %59 = llvm.getelementptr %58[0, 0] : (!llvm.ptr<array<4 x i8>>) -> !llvm.ptr, i8
+    %60 = llvm.mlir.addressof @newLine : !llvm.ptr<array<2 x i8>>
+    %61 = llvm.getelementptr %60[0, 0] : (!llvm.ptr<array<2 x i8>>) -> !llvm.ptr, i8
+    scf.for %arg0 = %13 to %11 step %12 {
+      %62 = index.casts %arg0 : index to i64
+      scf.for %arg1 = %13 to %10 step %12 {
+        %64 = index.casts %arg1 : index to i64
+        %65 = llvm.mul %62, %9  : i64
+        %66 = llvm.add %65, %64  : i64
+        %67 = llvm.getelementptr %18[%66] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+        %68 = llvm.load %67 : !llvm.ptr<f64>
+        %69 = llvm.call @printf(%59, %68) : (!llvm.ptr, f64) -> i32
+      }
+      %63 = llvm.call @printf(%61) : (!llvm.ptr) -> i32
+    }
+    llvm.call @free(%30) : (!llvm.ptr<i8>) -> ()
+    llvm.call @free(%17) : (!llvm.ptr<i8>) -> ()
+    return
+  }
+  gpu.module @main_kernel {
+    gpu.func @main_kernel(%arg0: !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>, %arg1: !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>) kernel {
+      %0 = llvm.mlir.constant(3 : index) : i64
+      %1 = gpu.block_id  x
+      %2 = gpu.thread_id  x
+      %3 = index.casts %1 : index to i64
+      %4 = index.casts %2 : index to i64
+      %5 = llvm.extractvalue %arg0[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+      %6 = llvm.mul %3, %0  : i64
+      %7 = llvm.add %6, %4  : i64
+      %8 = llvm.getelementptr %5[%7] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+      %9 = llvm.load %8 : !llvm.ptr<f64>
+      %10 = llvm.fmul %9, %9  : f64
+      %11 = llvm.fmul %10, %10  : f64
+      %12 = llvm.extractvalue %arg1[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+      %13 = llvm.mul %3, %0  : i64
+      %14 = llvm.add %13, %4  : i64
+      %15 = llvm.getelementptr %12[%14] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+      llvm.store %11, %15 : !llvm.ptr<f64>
+      gpu.return
+    }
+  }
+}
+```
+
+:::
+
+:::details 今できるかぎり最大限 lowering したもの
+
+```mlir
+'+compute_75' is not a recognized feature for this target (ignoring feature)
+'+compute_75' is not a recognized feature for this target (ignoring feature)
+'+compute_75' is not a recognized feature for this target (ignoring feature)
+module attributes {gpu.container_module} {
+  llvm.func @free(!llvm.ptr<i8>)
+  llvm.func @malloc(i64) -> !llvm.ptr<i8>
+  llvm.mlir.global internal constant @newLine("\0A\00") {addr_space = 0 : i32}
+  llvm.mlir.global internal constant @formatSpecifier("%f \00") {addr_space = 0 : i32}
+  llvm.func @printf(!llvm.ptr, ...) -> i32
+  llvm.func @main() {
+    %0 = llvm.mlir.constant(1.000000e+00 : f64) : f64
+    %1 = llvm.mlir.constant(2.000000e+00 : f64) : f64
+    %2 = llvm.mlir.constant(3.000000e+00 : f64) : f64
+    %3 = llvm.mlir.constant(4.000000e+00 : f64) : f64
+    %4 = llvm.mlir.constant(5.000000e+00 : f64) : f64
+    %5 = llvm.mlir.constant(6.000000e+00 : f64) : f64
+    %6 = llvm.mlir.constant(0 : index) : i64
+    %7 = llvm.mlir.constant(1 : index) : i64
+    %8 = llvm.mlir.constant(2 : index) : i64
+    %9 = llvm.mlir.constant(3 : index) : i64
+    %10 = builtin.unrealized_conversion_cast %9 : i64 to index
+    %11 = builtin.unrealized_conversion_cast %8 : i64 to index
+    %12 = builtin.unrealized_conversion_cast %7 : i64 to index
+    %13 = llvm.mlir.null : !llvm.ptr<f64>
+    %14 = llvm.getelementptr %13[6] : (!llvm.ptr<f64>) -> !llvm.ptr<f64>
+    %15 = llvm.ptrtoint %14 : !llvm.ptr<f64> to i64
+    %16 = llvm.call @malloc(%15) : (i64) -> !llvm.ptr<i8>
+    %17 = llvm.bitcast %16 : !llvm.ptr<i8> to !llvm.ptr<f64>
+    %18 = llvm.mlir.undef : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %19 = llvm.insertvalue %17, %18[0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %20 = llvm.insertvalue %17, %19[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %21 = llvm.insertvalue %6, %20[2] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %22 = llvm.insertvalue %8, %21[3, 0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %23 = llvm.insertvalue %9, %22[3, 1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %24 = llvm.insertvalue %9, %23[4, 0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %25 = llvm.insertvalue %7, %24[4, 1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %26 = llvm.mlir.null : !llvm.ptr<f64>
+    %27 = llvm.getelementptr %26[6] : (!llvm.ptr<f64>) -> !llvm.ptr<f64>
+    %28 = llvm.ptrtoint %27 : !llvm.ptr<f64> to i64
+    %29 = llvm.call @malloc(%28) : (i64) -> !llvm.ptr<i8>
+    %30 = llvm.bitcast %29 : !llvm.ptr<i8> to !llvm.ptr<f64>
+    %31 = llvm.mlir.undef : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %32 = llvm.insertvalue %30, %31[0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %33 = llvm.insertvalue %30, %32[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %34 = llvm.insertvalue %6, %33[2] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %35 = llvm.insertvalue %8, %34[3, 0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %36 = llvm.insertvalue %9, %35[3, 1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %37 = llvm.insertvalue %9, %36[4, 0] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %38 = llvm.insertvalue %7, %37[4, 1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+    %39 = llvm.mul %6, %9  : i64
+    %40 = llvm.add %39, %6  : i64
+    %41 = llvm.getelementptr %30[%40] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %0, %41 : !llvm.ptr<f64>
+    %42 = llvm.mul %6, %9  : i64
+    %43 = llvm.add %42, %7  : i64
+    %44 = llvm.getelementptr %30[%43] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %1, %44 : !llvm.ptr<f64>
+    %45 = llvm.mul %6, %9  : i64
+    %46 = llvm.add %45, %8  : i64
+    %47 = llvm.getelementptr %30[%46] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %2, %47 : !llvm.ptr<f64>
+    %48 = llvm.mul %7, %9  : i64
+    %49 = llvm.add %48, %6  : i64
+    %50 = llvm.getelementptr %30[%49] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %3, %50 : !llvm.ptr<f64>
+    %51 = llvm.mul %7, %9  : i64
+    %52 = llvm.add %51, %7  : i64
+    %53 = llvm.getelementptr %30[%52] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %4, %53 : !llvm.ptr<f64>
+    %54 = llvm.mul %7, %9  : i64
+    %55 = llvm.add %54, %8  : i64
+    %56 = llvm.getelementptr %30[%55] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    llvm.store %5, %56 : !llvm.ptr<f64>
+    gpu.launch_func  @main_kernel::@main_kernel blocks in (%11, %12, %12) threads in (%10, %12, %12) args(%38 : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>, %25 : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>)
+    %57 = llvm.mlir.addressof @formatSpecifier : !llvm.ptr<array<4 x i8>>
+    %58 = llvm.getelementptr %57[0, 0] : (!llvm.ptr<array<4 x i8>>) -> !llvm.ptr, i8
+    %59 = llvm.mlir.addressof @newLine : !llvm.ptr<array<2 x i8>>
+    %60 = llvm.getelementptr %59[0, 0] : (!llvm.ptr<array<2 x i8>>) -> !llvm.ptr, i8
+    llvm.br ^bb1(%6 : i64)
+  ^bb1(%61: i64):  // 2 preds: ^bb0, ^bb5
+    %62 = llvm.icmp "slt" %61, %8 : i64
+    llvm.cond_br %62, ^bb2, ^bb6
+  ^bb2:  // pred: ^bb1
+    llvm.br ^bb3(%6 : i64)
+  ^bb3(%63: i64):  // 2 preds: ^bb2, ^bb4
+    %64 = llvm.icmp "slt" %63, %9 : i64
+    llvm.cond_br %64, ^bb4, ^bb5
+  ^bb4:  // pred: ^bb3
+    %65 = llvm.mul %61, %9  : i64
+    %66 = llvm.add %65, %63  : i64
+    %67 = llvm.getelementptr %17[%66] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+    %68 = llvm.load %67 : !llvm.ptr<f64>
+    %69 = llvm.call @printf(%58, %68) : (!llvm.ptr, f64) -> i32
+    %70 = llvm.add %63, %7  : i64
+    llvm.br ^bb3(%70 : i64)
+  ^bb5:  // pred: ^bb3
+    %71 = llvm.call @printf(%60) : (!llvm.ptr) -> i32
+    %72 = llvm.add %61, %7  : i64
+    llvm.br ^bb1(%72 : i64)
+  ^bb6:  // pred: ^bb1
+    llvm.call @free(%29) : (!llvm.ptr<i8>) -> ()
+    llvm.call @free(%16) : (!llvm.ptr<i8>) -> ()
+    llvm.return
+  }
+  gpu.module @main_kernel attributes {gpu.binary = "\7FELF\02\01\013\07\00\00\00\00\00\00\00\02\00\BE\00z\00\00\00\00\00\00\00\00\00\00\00\80\0A\00\00\00\00\00\00\80\07\00\00\00\00\00\00K\05K\00@\008\00\03\00@\00\0C\00\01\00\00.shstrtab\00.strtab\00.symtab\00.symtab_shndx\00.nv.uft.entry\00.nv.info\00.text.main_kernel\00.nv.info.main_kernel\00.nv.shared.main_kernel\00.nv.constant0.main_kernel\00.rel.nv.constant0.main_kernel\00.debug_frame\00.rel.debug_frame\00.rela.debug_frame\00.nv.callgraph\00.nv.prototype\00.nv.rel.action\00\00.shstrtab\00.strtab\00.symtab\00.symtab_shndx\00.nv.uft.entry\00.nv.info\00main_kernel\00.text.main_kernel\00.nv.info.main_kernel\00.nv.shared.main_kernel\00.rel.nv.constant0.main_kernel\00.nv.constant0.main_kernel\00_param\00.debug_frame\00.rel.debug_frame\00.rela.debug_frame\00.nv.callgraph\00.nv.prototype\00.nv.rel.action\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00L\00\00\00\03\00\0B\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\A8\00\00\00\03\00\0A\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\C9\00\00\00\03\00\04\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\F9\00\00\00\03\00\07\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\15\01\00\00\03\00\08\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00@\00\00\00\12\10\0B\00\00\00\00\00\00\00\00\00\00\01\00\00\00\00\00\00\FF\FF\FF\FF$\00\00\00\00\00\00\00\FF\FF\FF\FF\FF\FF\FF\FF\03\00\04|\FF\FF\FF\FF\0F\0C\81\80\80(\00\08\FF\81\80(\08\81\80\80(\00\00\00\FF\FF\FF\FF4\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\01\00\00\00\00\00\00\04\04\00\00\00\044\00\00\00\0C\81\80\80(\00\04\FC\FF\FF?\00\00\00\00\00\00\00\04\11\08\00\06\00\00\00\00\00\00\00\04/\08\00\06\00\00\00\08\00\00\00\04\12\08\00\06\00\00\00\00\00\00\00\04\1C\04\00\D0\00\00\00\03\1B\FF\00\04\17\0C\00\00\00\00\00\00\00\00\00\00\F0\E1\00\04\17\0C\00\00\00\00\00\01\008\00\00\F0\E1\00\03\19p\00\04\0A\08\00\02\00\00\00`\01p\00\047\04\00z\00\00\00\046\04\00\01\00\00\00\00\00\00\00\FF\FF\FF\FF\00\00\00\00\FE\FF\FF\FF\00\00\00\00\FD\FF\FF\FF\00\00\00\00\FC\FF\FF\FFs\00\00\00\00\00\00\00\00\00\00\11%\00\056D\00\00\00\00\00\00\00\02\00\00\00\06\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\02z\01\00\00\0A\00\00\00\0F\00\00\00\C4\0F\00\19y\02\00\00\00\00\00\00!\00\00\00\22\0E\00\B9z\04\00\00Z\00\00\00\0A\00\00\00\C6\0F\00\19y\05\00\00\00\00\00\00%\00\00\00b\0E\00\19x\03\FF\1F\00\00\00\02\14\01\00\00\CA\1F\00%x\02\05\03\00\00\00\02\02\8E\07\00\CA/\00\19x\05\02\03\00\00\00\03\02\01\00\00\E4\0F\04\19x\04\02\03\00\00\00\FF\06\00\00\00\D0\0F\00\80y\02\04\04\00\00\00\00\EB\10\0C\00\A2\0E\00\B9z\04\00\00h\00\00\00\0A\00\00\00\E2\0F\00(r\02\02\02\00\00\00\00\00\00\00\00\10N\00(r\02\02\02\00\00\00\00\00\00\00\00\12\1E\00\85y\00\04\02\00\00\00\04\EB\10\0C\00\E2\1F\00My\00\00\00\00\00\00\00\00\80\03\00\EA\0F\00Gy\00\00\F0\FF\FF\FF\FF\FF\83\03\00\C0\0F\00\18y\00\00\00\00\00\00\00\00\00\00\00\C0\0F\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\01\00\00\00\03\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00@\00\00\00\00\00\00\00\11\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\0B\00\00\00\03\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00Q\01\00\00\00\00\00\00$\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\13\00\00\00\02\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00x\02\00\00\00\00\00\00\A8\00\00\00\00\00\00\00\02\00\00\00\06\00\00\00\08\00\00\00\00\00\00\00\18\00\00\00\00\00\00\00\B6\00\00\00\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00 \03\00\00\00\00\00\00p\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\007\00\00\00\00\00\00p\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\90\03\00\00\00\00\00\00$\00\00\00\00\00\00\00\05\00\00\00\00\00\00\00\04\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00R\00\00\00\00\00\00p\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\B4\03\00\00\00\00\00\00L\00\00\00\00\00\00\00\05\00\00\00\0B\00\00\00\04\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\E6\00\00\00\01\00\00p\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\04\00\00\00\00\00\00 \00\00\00\00\00\00\00\05\00\00\00\00\00\00\00\04\00\00\00\00\00\00\00\08\00\00\00\00\00\00\00\02\01\00\00\0B\00\00p\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00 \04\00\00\00\00\00\00\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\08\00\00\00\00\00\00\00\08\00\00\00\00\00\00\00\C3\00\00\00\09\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\000\04\00\00\00\00\00\00\10\00\00\00\00\00\00\00\05\00\00\00\04\00\00\00\08\00\00\00\00\00\00\00\10\00\00\00\00\00\00\00~\00\00\00\01\00\00\00\02\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00@\04\00\00\00\00\00\00\D0\01\00\00\00\00\00\00\00\00\00\00\0B\00\00\00\04\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00@\00\00\00\01\00\00\00\06\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\80\06\00\00\00\00\00\00\00\01\00\00\00\00\00\00\05\00\00\00\06\00\00\08\80\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\06\00\00\00\05\00\00\00\80\0A\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\A8\00\00\00\00\00\00\00\A8\00\00\00\00\00\00\00\08\00\00\00\00\00\00\00\01\00\00\00\05\00\00\00@\04\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00@\03\00\00\00\00\00\00@\03\00\00\00\00\00\00\08\00\00\00\00\00\00\00\01\00\00\00\05\00\00\00\80\0A\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\A8\00\00\00\00\00\00\00\A8\00\00\00\00\00\00\00\08\00\00\00\00\00\00\00"} {
+    llvm.func @main_kernel(%arg0: !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>, %arg1: !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>) attributes {gpu.kernel, nvvm.kernel} {
+      %0 = llvm.mlir.constant(3 : index) : i64
+      %1 = nvvm.read.ptx.sreg.ctaid.x : i32
+      %2 = llvm.sext %1 : i32 to i64
+      %3 = nvvm.read.ptx.sreg.tid.x : i32
+      %4 = llvm.sext %3 : i32 to i64
+      %5 = llvm.extractvalue %arg0[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+      %6 = llvm.mul %2, %0  : i64
+      %7 = llvm.add %6, %4  : i64
+      %8 = llvm.getelementptr %5[%7] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+      %9 = llvm.load %8 : !llvm.ptr<f64>
+      %10 = llvm.fmul %9, %9  : f64
+      %11 = llvm.fmul %10, %10  : f64
+      %12 = llvm.extractvalue %arg1[1] : !llvm.struct<(ptr<f64>, ptr<f64>, i64, array<2 x i64>, array<2 x i64>)>
+      %13 = llvm.mul %2, %0  : i64
+      %14 = llvm.add %13, %4  : i64
+      %15 = llvm.getelementptr %12[%14] : (!llvm.ptr<f64>, i64) -> !llvm.ptr<f64>
+      llvm.store %11, %15 : !llvm.ptr<f64>
+      llvm.return
+    }
+  }
+}
+
+```
+
+:::
+
+### 課題点
+
+実はまだこれを GPU Dialect で Cubin に変換するところまでは出来たのですが、実際に実行するところまではできていません。
+課題としては次のようなものがあります。
+
+- GpuToLLVMConversionPass を実行しているのにも関わらず、`gpu.launch_func`というホスト側のカーネル立ち上げ命令を LLVM IR に変換できていない。
+- GPU カーネルに対して渡しているポインタは、ホスト側の`malloc`で確保したものになっているので、これを`gpu.alloc`で置き換えて、`gpu.memcopy`でホスト側に渡すなどのパスを自作する必要がある。^[探した限りではそのようなパスは標準では用意されていなかった。]
+
+特に`gpu.launch_func`がうまく lowering 出来ない問題は対処法が分からず困っているので、もし分かる方がいらしたら教えてください。
+
+## 最後に：MLIR 学習に役立ったもの
+
+- [Toy Tutorial](https://mlir.llvm.org/docs/Tutorials/Toy/)
+  - これをベースに学習した。[llvm-project リポジトリ内に実際のコードがある](https://github.com/llvm/llvm-project/tree/main/mlir/examples/toy)ので、これを見ながらやると良い。Web サイト見ただけではかなりの部分が省略されている。
+- [LLVM Youtube](https://www.youtube.com/@LLVMPROJ)
+  - LLVM Dev Mtg という LLVM のカンファレンスの講演の様子がアップロードされている。LLVM だけでなく、MLIR の話題もかなりある。イメージを掴むのに最適。個人的にはリスニングの練習もしたかったので一石二鳥だった。
+- [LLVM Discussion Forums](https://discourse.llvm.org/)
+  - 自分で質問することができる他、他の初心者の疑問と、その回答もたくさんある。自分の場合は、質問せず似た問題に直面している質問を調べることが多かった。自分が GPU Dialect に lowering するときに役立った質問には[いいねしてある](https://discourse.llvm.org/u/lemolatoon/activity/likes-given)。
