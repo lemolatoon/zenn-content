@@ -377,7 +377,7 @@ module {
 lowering とは、ある Dialect(中間表現)から、異なる Dialect へ変換することを指します。^[[参考](https://mlir.llvm.org/docs/Tutorials/Toy/Ch-5/)]より機械語へ近い、低いレイヤへと落ちていくため、lowering です。（少なくとも筆者はそう思っている。）
 
 Affine Dialect は MLIR の標準 Dialect(中間表現)の１つです。^[https://mlir.llvm.org/docs/Dialects/Affine/]
-Affine Dialect は affine 変換を抽象化した命令達を提供する Dialect です。しかし、ここでは`affine.for`というループを用いるために Affine Dialect へ変換しています。SCF Dialect^[structured control flow を表す[Dialect](https://mlir.llvm.org/docs/Dialects/SCFDialect/)。より一般的な for や if, while などの制御構文を表現できる。]に lowring する手もありますが、Affine Dialect のほうが制約が強く、特殊な for 文を表現しているため、より強い最適化が期待できます。
+Affine Dialect は affine 変換を抽象化した命令達を提供する Dialect です。しかし、ここでは`affine.for`というループを用いるために Affine Dialect を使っています。SCF Dialect^[structured control flow を表す[Dialect](https://mlir.llvm.org/docs/Dialects/SCFDialect/)。より一般的な for や if, while などの制御構文を表現できる。]に lowring する手もありますが、Affine Dialect のほうが制約が強く、特殊な for 文を表現しているため、より強い最適化が期待できます。
 
 `tensor`型は`memref`型^[['memref' Dialect](https://mlir.llvm.org/docs/Dialects/MemRef/)で定義される型]へと変換します。この型は、具体的なメモリ領域を表現する型です。`memref.alloc`でメモリ確保し、`memref.dealloc`で解放する必要があります。
 また、具体的な足し算や掛け算などの演算は、`arith.addf`、`arith.mulf`で行います。これらの命令は Arith Dialect^[https://mlir.llvm.org/docs/Dialects/ArithOps/]という一般的な算術演算を表す Dialect です。
@@ -588,7 +588,7 @@ B ==> |PrintOp のみ| G2[SCFなど]
 G2 ==> L
 ```
 
-この図において、太字で表す部分を`ToyToLLVMLoweringPass`というパスとして定義することにします。一見大変そうですが、Memref Dialect から LLVM Dialect といった、MLIR 標準の Dialect 間の変換は既にコミュニティによって実装されています。
+この図において、太い矢印で表す部分を`ToyToLLVMLoweringPass`というパスとして定義することにします。一見大変そうですが、Memref Dialect から LLVM Dialect といった、MLIR 標準の Dialect 間の変換は既にコミュニティによって実装されています。
 よって、自分たちで実装しなければならないのは、Toy Dialect から LLVM Dialect への変換、特に`PrintOp`から LLVM Dialect への変換のみになります。
 
 LLVM Dialect への変換とは言っても、一気に LLVM Dialect まで lowering する必要はありません。「LLVM Dialect への変換が実装されている Dialect」へ変換すれば良いことになります。
@@ -851,9 +851,9 @@ GPU Dialect は、CUDA や OpenCL といった GPU カーネルのプログラ�
 
 GPU Dialect からは、カーネル部分を NVIDIA GPU 用のバイナリである[cubin](https://docs.nvidia.com/cuda/cuda-binary-utilities/index.html#what-is-a-cuda-binary)に変換したり、AMD の GPU 上で実行することができるバイナリである[hsaco](https://gpuopen.com/learn/amdgcn-assembly/)^[自分もあまりまだ分かってない]に変換したりすることができます。
 また、ホスト側のコードも、LLVM Dialect に落とすことができます。^[おそらく内部で CUDA の API を読んだりすることになる]
-また、OpenCL のカーネルの中間表現である SPIRV Dialect に落とすこともできるようです。^[未検証: https://mlir.llvm.org/doxygen/GPUToSPIRVPass_8cpp_source.html]
+また、OpenCL のカーネルの中間表現である [SPIRV Dialect](https://mlir.llvm.org/docs/Dialects/SPIR-V/) に落とすこともできるようです。^[未検証: https://mlir.llvm.org/doxygen/GPUToSPIRVPass_8cpp_source.html]
 
-このように、様々な Output の候補がある中で、抽象化して様々なパスを集約する役割がある Dialect を Hourglass Dialect と呼ぶようです。^[[この動画のこの部分](https://youtu.be/hIt6J1_E21c?si=qbvoZc0_cH8M5f6S&t=956)でそう呼ばれている。]
+このように、様々な Output の候補がある中で、抽象化して様々な Dialect を集約する役割がある Dialect を Hourglass Dialect と呼ぶようです。^[[この動画のこの部分](https://youtu.be/hIt6J1_E21c?si=qbvoZc0_cH8M5f6S&t=956)でそう呼ばれている。]
 
 ### Lowering 戦略
 
