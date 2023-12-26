@@ -3,7 +3,7 @@ title: "【MLIR】GPU上で走る自作言語のコンパイラを作ってい�
 emoji: "⛱️"
 type: "tech" # tech: 技術記事 / idea: アイデア
 topics: ["MLIR", "LLVM", "GPU", "compiler"]
-published: false
+published: true
 ---
 
 この記事は、KCS アドベントカレンダー 23 日目の記事です。
