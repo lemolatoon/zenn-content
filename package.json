@@ -10,5 +10,8 @@
   },
   "dependencies": {
     "zenn-cli": "^0.1.150"
+  },
+  "volta": {
+    "node": "20.14.0"
   }
 }
