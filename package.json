@@ -9,7 +9,7 @@
     "preview": "zenn preview"
   },
   "dependencies": {
-    "zenn-cli": "^0.1.150"
+    "zenn-cli": "^0.1.158"
   },
   "volta": {
     "node": "20.14.0"
