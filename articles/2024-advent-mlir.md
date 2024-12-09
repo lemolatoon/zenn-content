@@ -920,7 +920,8 @@ step2では、まず「１つの整数をそのプログラムのexit codeとし
     └── CMakeLists.txt
 ```
 
-まずは、ソースコードをMLIRのフレームワークに載せる部分までを作ります。ソースコードはまず、単語の並びに変換されます。これを、字句解析（Lexical Analysis）といいます。現在の言語では、１つの数字しか考えないので、かなり単純に作ることができます。単語を表すクラスを`Token`、字句解析をするクラスを`Lexer`という名前で宣言します。
+#### Lexerをつくる
+コンパイルの過程において、ソースコードはまず、単語の並びに変換されます。これを、字句解析（Lexical Analysis）といいます。現在の言語では、１つの数字しか考えないので、かなり単純に作ることができます。単語を表すクラスを`Token`、字句解析をするクラスを`Lexer`という名前で宣言します。
 ```cpp:include/lexer.h
 #pragma once
 
@@ -1128,4 +1129,391 @@ Token(NumLit, 123)
 ```
 `Token(NumLit, 123)`のように出れば、正しく`Lexer`が動いていることが分かります。
 
-次に、コンパイラは`Token`の列を抽象構文木（Abstract Syntax Tree）というものに変換します。この変換をすることをパースすると呼びます。NyaZyではこの処理を`Parser` classが担っています。
+#### Parserをつくる
+次に、コンパイラは`Token`の列を抽象構文木（AST: Abstract Syntax Tree）というものに変換します。この変換をすることをパースすると呼びます。NyaZyではこの処理を`Parser` classが担っています。
+まずは、ASTを表現するclassを作成します。今後、プログラミング言語における「式（Expr: Expression）」を表現するために、そのbase classとして`ExprASTNode`を定義します。さらに、数字の定数を表す派生クラスである`NumLitExpr`を定義します。
+```cpp:include/ast.h
+#pragma once
+
+#include <cstdint>
+#include <memory>
+
+namespace nyacc {
+// Visitor パターン
+// ASTをtraverse（走査）するときに使う。今はとりあえず定義だけ。
+class Visitor {
+public:
+  virtual ~Visitor() = default;
+  virtual void visit(const class ModuleAST &node) = 0;
+  virtual void visit(const class NumLitExpr &node) = 0;
+};
+
+// base class
+class ExprASTNode {
+public:
+  // 派生クラスの種類を表すenumを定義。LLVM-style RTTIのため。
+  enum class ExprKind {
+    NumLit,
+  };
+  explicit ExprASTNode(ExprKind kind) : kind_(kind) {}
+  virtual ~ExprASTNode() = default;
+  // Visitor パターンのために必要な関数
+  virtual void accept(class Visitor &v) = 0;
+  // 標準出力へ情報をdumpする。
+  virtual void dump(int level) const = 0;
+  ExprKind getKind() const { return kind_; };
+
+private:
+  // 派生クラスの種類を持つ
+  ExprKind kind_;
+};
+
+class NumLitExpr : public ExprASTNode {
+public:
+  // kind_は派生クラスの種類でbase classのコンスタント呼び出し。
+  NumLitExpr(int64_t value) : ExprASTNode(ExprKind::NumLit), value_(value) {}
+
+  // Visitor パターンのためのボイラープレート
+  void accept(Visitor &v) override { v.visit(*this); }
+  int64_t getValue() const { return value_; }
+
+  static bool classof(const ExprASTNode *node) {
+    return node->getKind() == ExprKind::NumLit;
+  }
+
+  void dump(int level) const override;
+
+private:
+  int64_t value_;
+};
+
+// ソースコード全体を表すclass。現段階では、exit codeを表す定数整数式１つだけを持つ
+class ModuleAST {
+public:
+  ModuleAST(std::unique_ptr<ExprASTNode> expr) : expr_(std::move(expr)) {}
+  void accept(Visitor &v) const { v.visit(*this); };
+  void dump(int level = 0) const;
+  const std::unique_ptr<ExprASTNode> &getExpr() const { return expr_; }
+
+private:
+  std::unique_ptr<ExprASTNode> expr_;
+};
+} // namespace nyacc
+```
+
+:::details LLVMにおける実行時型情報
+C++には、親クラスから派生クラスへキャストを試みるときに、`dynamic_cast`を使うことで、実行時にその派生クラスであるのかどうかを判定しつつキャストできます。一方で、LLVMでは、デフォルトで実行時型情報（RTTI: Run-Time Type Information）が無効にされています。代わりに、[LLVM-style RTTI](https://llvm.org/docs/HowToSetUpLLVMStyleRTTI.html)を使います。LLVM-style RTTIでは、`static bool classof(const BaseClass *)`を派生クラスへ定義することで、`llvm::dyn_cast<DerivedClass>(base_class_ptr)`として実行時型キャストができるようになります。NyaZyのASTでは、LLVM-style RTTIを採用しています。
+:::
+
+標準出力へAST情報をダンプする`void dump(int level)`は、`src/ast.cpp`へ実装を書きます。`level`はネストの深さです。
+```cpp:src/ast.cpp
+#include "ast.h"
+#include <iostream>
+
+namespace nyacc {
+void ModuleAST::dump(int level) const {
+  std::cout << "ModuleAST\n";
+  expr_->dump(level + 1);
+}
+
+void NumLitExpr::dump(int level) const {
+  std::cout << std::string(level, ' ') << "NumLitExpr(" << value_ << ")\n";
+}
+} // namespace nyacc
+```
+
+`ModuleAST`はプログラムそのものを表すclassです。次に`Token`列から`ModuleAST`に変換する役割を担う`Parser`を実装します。
+```cpp:include/parser.h
+#pragma once
+
+#include "ast.h"
+#include "lexer.h"
+
+namespace nyacc {
+class Parser {
+public:
+  // token列とどこまで次にパースを開始する位置を持つ
+  Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)), pos_(0) {}
+
+  // トークン列をパースして、ModuleASTを組み上げる
+  ModuleAST parseModule();
+
+private:
+  std::unique_ptr<ExprASTNode> parseExpr();
+  std::vector<Token> tokens_;
+  size_t pos_{0};
+};
+} // namespace nyacc
+```
+実装は、`src/parser.cpp`にします。
+```cpp:src/parser.cpp
+#include "parser.h"
+#include "ast.h"
+#include <charconv>
+#include <iostream>
+
+namespace nyacc {
+
+ModuleAST Parser::parseModule() {
+  // 現段階では、プログラムは１つの式からなる
+  auto expr = parseExpr();
+  return ModuleAST(std::move(expr));
+}
+
+std::unique_ptr<ExprASTNode> Parser::parseExpr() {
+  // 今のところは、`NumLitExpr`しかない
+  const auto &token = tokens_[pos_];
+  switch (token.getKind()) {
+  case Token::TokenKind::NumLit: {
+    // Tokenは`token.text()`でそのトークンを表す`std::string_view`が得られる。
+    // これを整数に変換する。
+    int64_t result = 0;
+    auto [ptr, ec] = std::from_chars(
+        token.text().data(), token.text().data() + token.text().size(), result);
+
+    if (ec == std::errc()) {
+      // Tokenを１つ消費したので、`pos_`をインクリメント
+      pos_++;
+      // `NumLitExpr`を返す
+      return std::make_unique<NumLitExpr>(result);
+    } else {
+      std::cerr << "Unexpected token: " << token << "\n";
+      std::abort();
+    }
+  }
+  case Token::TokenKind::Eof:
+    std::cerr << "Unexpected token: " << token << "\n";
+    std::abort();
+    break;
+  }
+}
+
+} // namespace nyacc
+```
+ここまでで、トークン列をパースしてASTを組み上げるところはできたはずです。試しにbuildしてみましょう。`src/CMakeLists.txt`にファイルを追記します。
+```cmake:src/CMakeLists.txt
+...
+# Locate all the .cpp files in the src directory
+set(SRC_FILES
+    main.cpp
+    lexer.cpp
+    # 新たにsrc以下に追加してファイルを足す
+    ast.cpp
+    parser.cpp
+)
+...
+```
+正しくパースができているか確かめるために、`src/main.cpp`も編集します。
+```cpp:src/main.cpp
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinDialect.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/Verifier.h"
+#include <iostream>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/raw_ostream.h>
+#include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Pass/Pass.h>
+#include <mlir/Pass/PassManager.h>
+#include <mlir/Pass/PassRegistry.h>
+#include <mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h>
+#include <mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h>
+#include <mlir/Target/LLVMIR/Export.h>
+
+#include "ast.h"
+#include "lexer.h"
+#include "parser.h"
+
+int main() {
+  std::string src = R"(
+123
+)";
+  llvm::outs() << "Source code:\n";
+  llvm::outs() << src;
+  nyacc::Lexer lexer("123");
+  llvm::outs() << "Tokens:\n";
+  const auto tokens = lexer.tokenize();
+  for (const auto &token : tokens) {
+    std::cout << token << "\n";
+  }
+  nyacc::Parser parser{tokens};
+  auto moduleAst = parser.parseModule();
+  llvm::outs() << "AST:\n";
+  moduleAst.dump();
+
+  return 0;
+}
+```
+実行してみましょう。`AST:`の下に、ASTがdumpされる様子が確認できたら成功です！
+```bash
+$ ./bin build
+$ ./bin nyacc
+Source code:
+
+123
+Tokens:
+Token(NumLit, 123)
+AST:
+ModuleAST
+ NumLitExpr(123)
+```
+---
+がんばってパーサーを作ったわけですが、まだMLIRの世界へは踏み入れていません。ここからはいよいよASTをMLIRの世界の中間言語に変換し、MLIRの基盤の上に乗っていきます。
+
+#### MLIRのDialectを記述する
+ASTからMLIRのDialect（中間言語）に変換するとき、まずはASTと一対一に対応するようなDialectを設計してそこから始めるのが鉄板です。[^dialect-design-yt]
+
+MLIRでは、Dialectに限らずすべてC++で記述*される*必要があります。だからといってすべてを自分で１から書く必要はありません。[Operation Definition Specification(ODS)](https://mlir.llvm.org/docs/DefiningDialects/Operations/)というC++を生成するためのDSLを使うことができます。ODSを使うことで、ボイラープレートを書くのを避けることができます。基本的はTableGenを使うほうが良いと思いますし、C++ですべてを記述するには、MLIR自体の設計を理解する必要があると思います。（自分はあまり理解していません。）[^table-gen]
+
+[^dialect-design-yt]: https://youtu.be/hIt6J1_E21c?si=goNbwW-2lEIvHY7t&t=801 Input Dialectと呼ばれている。他にも、この動画はDialectを設計する上で役に立つので暇な時間に見てみるのはオススメです。
+[^table-gen]: ODSは[TableGen](https://llvm.org/docs/TableGen/index.html)というLLVMのDSLを作るためのツール？によってできています。
+
+ODSを用いて、現在のASTと対応する`NyaZyDialect`を作成します。`NyaZyDialect`では、`nyazy.func`、`nyazy.return`、`nyazy.constant`を定義することにします。
+```td:include/ir/NyaZyDialect.td
+#ifndef NYAZY_DIALECT
+#define NYAZY_DIALECT
+
+include "mlir/IR/OpBase.td"
+
+//===----------------------------------------------------------------------===//
+// NyaZy dialect definition.
+//===----------------------------------------------------------------------===//
+
+def NyaZyDialect : Dialect {
+    let name = "nyazy";
+    let summary = "NyaZy language dialect.";
+    let description = [{
+        This dialect is NyaZy language dialect aimed to one to one mapping to the NyaZy language AST.
+    }];
+    let cppNamespace = "nyacc";
+}
+
+//===----------------------------------------------------------------------===//
+// Base NyaZy operation definition.
+//===----------------------------------------------------------------------===//
+
+class NyaZyOp<string mnemonic, list<Trait> traits = []> :
+        Op<NyaZyDialect, mnemonic, traits>;
+
+#endif // NYAZY_DIALECT
+```
+
+```td:include/ir/NyaZyOps.td
+#ifndef NYAZY_OPS
+#define NYAZY_OPS
+
+include "NyaZyDialect.td"
+include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/IR/OpAsmInterface.td"
+include "mlir/Interfaces/InferIntRangeInterface.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/IR/BuiltinAttributeInterfaces.td"
+include "mlir/Interfaces/CallInterfaces.td"
+include "mlir/Interfaces/FunctionInterfaces.td"
+include "mlir/IR/SymbolInterfaces.td"
+
+// Almost taken from `arith.constant`
+def ConstantOp : NyaZyOp<"constant", 
+    [Pure,
+     AllTypesMatch<["value", "result"]>,
+     ]> {
+    let summary = "integer or floating point constant operation";
+    let description = [{
+        Constant operation turns a literal into an SSA value. The data is attached
+        to the operation as an attribute.
+
+        TODO: Example:
+
+        ```mlir
+        %0 = "nyazy.constant" 2 : i32
+        // Equivalent generic form
+        %1 = "nyazy.constant"() {value = 42 : i32} : () -> i32
+        ```
+    }];
+
+    let arguments = (ins TypedAttrInterface:$value);
+    let results = (outs /*SignlessIntegerOrFloatLike*/AnyType:$result);
+
+    let assemblyFormat = "attr-dict $value";
+}
+
+def FuncOp : NyaZyOp<"func", [
+    FunctionOpInterface,
+    IsolatedFromAbove,
+]> {
+    let summary = "function operation";
+    let description = [{
+        The "nyazy.func" operation represents a function in the NyaZy language.
+        Currently the main function is implicitly defined in the module.
+    }];
+
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        TypeAttrOf<FunctionType>:$function_type,
+        OptionalAttr<DictArrayAttr>:$arg_attrs,
+        OptionalAttr<DictArrayAttr>:$res_attrs
+    );
+    let regions = (region AnyRegion:$body);
+
+    let builders = [
+        OpBuilder<(ins
+            "mlir::StringRef":$name, "mlir::FunctionType":$type,
+            CArg<"mlir::ArrayRef<mlir::NamedAttribute>", "{}">:$attrs
+        )>
+    ];
+
+    let extraClassDeclaration = [{
+        //===------------------------------------------------------------------===//
+        // FunctionOpInterface Methods
+        //===------------------------------------------------------------------===//
+
+        /// Returns the argument types of this function.
+        mlir::ArrayRef<mlir::Type> getArgumentTypes() { return getFunctionType().getInputs(); }
+
+        /// Returns the result types of this function.
+        mlir::ArrayRef<mlir::Type> getResultTypes() { return getFunctionType().getResults(); }
+
+        mlir::Region *getCallableRegion() { return &getBody(); }
+    }];
+
+    let hasCustomAssemblyFormat = 1;
+    let skipDefaultBuilders = 1;
+}
+
+def ReturnOp : NyaZyOp<"return", 
+    [Terminator]> {
+    let summary = "return operation";
+    let description = [{
+        Return operation terminates the program with a given status code.
+        This operation is temporary added to this dialect to support the `exiting with the expression result as status code`.
+    }];
+
+    let arguments = (ins AnyType:$operand);
+    let results = (outs);
+}
+
+#endif // NYAZY_OPS
+```
+`NyaZyDialect.td`では、まずDialect自体の定義をしています。`NyaZyOps`というので、`NyaZyDialect`の命令のベースクラスを定義しています。このあたりは、定型句だと思います。
+`NyaZyOps.td`では、各命令を定義しています。仕様としては、[ODSのドキュメント](https://mlir.llvm.org/docs/DefiningDialects/Operations/)を参照する必要がありますが、ここでも簡単に解説します。
+
+- `NaZyOp<"constant", [Pure, AllTypesMatch<"value", "result">]>`の、始めの文字列は命令の名前です。その後のリスト部分は、その命令が持つ性質を表しています。たとえば、`Pure`は副作用のない純粋な命令です。ドキュメントの[Operation traits and constraints](https://mlir.llvm.org/docs/DefiningDialects/Operations/#operation-traits-and-constraints)で説明されています。
+- `summary`、`description`はそれぞれ命令のドキュメントになっています。プログラムの動作には関係ありませんが、他の人にその命令はどのような動作で、どのような意味を持つのかを伝えるという点で重要です。[^mlir-op-semantics] 重要と言っておきながら、`NyaZy`では個人開発なので割とサボっています。
+- `arguments`は、その命令が取る引数を表しています。引数は`operand`か`attribute`か`property`のいずれかを取ることができます。`operand`が命令が取る値で実行時に決まる値であり、`attribute`と`property`はコンパイル時に決まる値だという認識があればとりあえずは大丈夫です。詳しくは、[Operation arguments](https://mlir.llvm.org/docs/DefiningDialects/Operations/#operation-arguments)を読んでください。
+`nyazy.constant`は簡単に言えば定数を実行時の値に変換するようなものです。`attribute`として整数を保持しておき、それを生成します。
+- `results`はその命令が産出する実行時の値です。`nyazy.constant`では、`AnyType`としてしまっていますが、より詳しく型を指定することもできます。
+- `assemblyFormat`では、MLIRを文字列表現にserializeしたときの表示のされ方を決めることができます。`let hasCustomAssemblyFormat = 1;`として、C++側でそれを記述することもできます。
+- `builders`では、そのクラスをコンストラクトするメソッドである`build`のオーバーロードの宣言を増やすことができます。実装はC++で提供する必要があります。
+- `extraClassDeclaration`では、他に足したい便利メンバ関数などを増やすことができます。クラスの宣言のところに足されるので、実装はC++側ですることもできますし、短い実装ならODSに記述してしまうこともできます。[^build-at-extraClassDecl]
+- `nyazy.func`では、`let regions`というものを記述しています。ここでは、その命令に属する[Region](https://mlir.llvm.org/docs/LangRef/#regions)を指定できます。`Region`は、[Block](https://mlir.llvm.org/docs/LangRef/#blocks)の列で、`Block`は`Operation`（命令）の列です。`nyazy.func`は、NyaZyにおける関数を定義する命令で、`nyazy.func`はその関数の中身として`Region`を持っています。これにより、ある命令が、複数の命令を内部的に持つということができます。その`Region`がどのような意味を持つのかは命令ごとに違いますが、`nyazy.func`の場合は、関数が呼ばれたときに実行される命令列となるわけです。他の例としては、[scf.for](https://mlir.llvm.org/docs/Dialects/SCFDialect/#scffor-scfforop)という`for`文を表す命令があったりして、この場合は`for`文の内側の命令列を表していることになったりします。これも１例に過ぎません。
+
+このODSはわりと受け入れがたいと思いますが、とりあえずはそういうものなんだと受け入れる他ないです。生成されたC++を見たり、他のODSの記述例を参考にすることでなんとか自分でも記述することができます。`nyazy.constant`は[arith.constant](https://mlir.llvm.org/docs/Dialects/ArithOps/#arithconstant-arithconstantop)の、`nyazy.func`、`nyazy.return`は[func.func](https://mlir.llvm.org/docs/Dialects/Func/#funcfunc-funcfuncop)、[func.return](https://mlir.llvm.org/docs/Dialects/Func/#funcreturn-funcreturnop)のODSをほぼそのまま持ってきています。
+
+[^mlir-op-semantics]: MLIRでは命令を定義しただけでは、その命令の型を定義しただけで振る舞いはドキュメント以外には現れません。その命令を別の命令に変換して初めてその命令の振る舞いがコード上に間接的に現れます。これはドキュメントで規定する振る舞いと一致すべきですし、ドキュメントが１次情報で仕様となるべきです。
+[^build-at-extraClassDecl]: 原理的には、ここに`build`メソッドを記述することもできると思います。
