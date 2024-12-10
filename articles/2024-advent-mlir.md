@@ -1989,3 +1989,152 @@ module {
 ```
 
 #### NyaZyDialectからLLVM Dialectへと変換する
+ようやくMLIRのフレームワークに沿ってソースコードを表現することができました。ここからはMLIRの便利な機能をフルに活用していくことができます。目標は、これをLLVM IRをMLIRのフレームワークで記述したLLVM Dialectへと変換することです。
+NyaZyDialectからLLVM Dialectへの変換戦略を再掲します。
+```mermaid
+graph TD;
+    A[nyazy] --> B[arith]
+    A[nyazy] --> C[memref]
+    A[nyazy] --> D[scf]
+    D[scf] --> E[cf]
+    A[nyazy] --> F[func]
+
+    B[arith] --> G[llvm]
+    C[memref] --> G[llvm]
+    E[cf] --> G[llvm]
+    F[func] --> G[llvm]
+    A[nyazy] --> G[llvm]
+```
+整数のexit codeを表現するだけならば、`nyazy.func`、`nyazy.return`、`nyazy.constant`のみを表現できれば良いので、次のようにシンプルになります。
+```mermaid
+graph TD;
+    A[nyazy] --> B[arith]
+    A[nyazy] --> F[func]
+
+    B[arith] --> G[llvm]
+    F[func] --> G[llvm]
+```
+`nyazy.func`は、[func.func](https://mlir.llvm.org/docs/Dialects/Func/#funcfunc-funcfuncop)に、`nyazy.return`は[func.return](https://mlir.llvm.org/docs/Dialects/Func/#funcreturn-funcreturnop)にマッピングし、`nyazy.constant`は[arith.constant](https://mlir.llvm.org/docs/Dialects/ArithOps/#arithconstant-arithconstantop)にマッピングします。
+`src/ir/lowerToLLVM.cpp`にこの変換を書いていきます。
+
+1. `nyazy.return`と`nyazy.constant`の変換
+
+ある命令に対して一律に変換するときは、`mlir::OpConversionPattern`を継承して、`matchAndRewrite`を使うことで実現できます。第１引数にもとの命令、第３引数に`mlir::ConversionPatternRewriter`というものを受け取ります。`rewriter`を使って命令を追加できる。また、`rewriter.erase`とすると、下の命令を消すことができるし、`rewriter.replaceOp`を使うと、置き換えることもできる。
+```cpp:src/ir/lowerToLLVM.cpp
+#include "ir/NyaZyDialect.h"
+#include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "ir/NyaZyOps.h"
+#include <iostream>
+#include <llvm/Support/raw_ostream.h>
+#include <mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h>
+#include <mlir/Dialect/LLVMIR/LLVMDialect.h>
+#include <mlir/Dialect/LLVMIR/LLVMTypes.h>
+#include <mlir/IR/Builders.h>
+#include <mlir/IR/BuiltinAttributes.h>
+#include <mlir/IR/Operation.h>
+#include <mlir/IR/PatternMatch.h>
+#include <mlir/Support/LLVM.h>
+#include <mlir/Support/TypeID.h>
+#include "mlir/IR/BuiltinDialect.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "ir/Pass.h"
+
+namespace {
+
+class ConstantOpLowering : public mlir::OpConversionPattern<nyacc::ConstantOp> {
+public:
+    explicit ConstantOpLowering(mlir::MLIRContext *context)
+        : OpConversionPattern(context) {}
+    
+    mlir::LogicalResult matchAndRewrite(nyacc::ConstantOp op, OpAdaptor adaptor [[maybe_unused]],
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+        auto constantOp = mlir::cast<nyacc::ConstantOp>(op);
+        rewriter.replaceOp(op, rewriter.create<mlir::arith::ConstantOp>(
+            op->getLoc(), constantOp.getValue()
+        ));
+
+        return mlir::success();
+    }
+};
+
+class ReturnOpLowering : public mlir::OpRewritePattern<nyacc::ReturnOp> {
+public:
+    explicit ReturnOpLowering(mlir::MLIRContext *context)
+        : OpRewritePattern(context) {}
+    
+    mlir::LogicalResult matchAndRewrite(nyacc::ReturnOp op, mlir::PatternRewriter &rewriter) const final {
+        rewriter.replaceOpWithNewOp<mlir::func::ReturnOp>(op, op->getOperands());
+
+        return mlir::success();
+    }
+};
+
+struct FuncOpLowering : public mlir::OpConversionPattern<nyacc::FuncOp> {
+  using OpConversionPattern<nyacc::FuncOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(nyacc::FuncOp op, OpAdaptor adaptor [[maybe_unused]],
+                  mlir::ConversionPatternRewriter &rewriter) const final {
+    // We only lower the main function as we expect that all other functions
+    // have been inlined.
+    if (op.getName() != "main")
+      return mlir::failure();
+
+    // Verify that the given main has no inputs and results.
+    if (op.getNumArguments() || op.getFunctionType().getNumResults()) {
+      return rewriter.notifyMatchFailure(op, [](mlir::Diagnostic &diag) {
+        diag << "expected 'main' to have 0 inputs and 0 results";
+      });
+    }
+
+    auto mainFuncType = mlir::FunctionType::get(rewriter.getContext(), {}, {rewriter.getI64Type()});
+
+    // Create a new non-toy function, with the same region.
+    auto func = rewriter.create<mlir::func::FuncOp>(op.getLoc(), op.getName(),
+                                                    mainFuncType);
+    rewriter.inlineRegionBefore(op.getRegion(), func.getBody(), func.end());
+    rewriter.eraseOp(op);
+
+    return mlir::success();
+  }
+};
+
+class NyaZyToLLVMPass : public mlir::PassWrapper<NyaZyToLLVMPass, mlir::OperationPass<mlir::ModuleOp>> {
+public:
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NyaZyToLLVMPass)
+    void getDependentDialects(mlir::DialectRegistry &registry) const override {
+        registry.insert<nyacc::NyaZyDialect, mlir::func::FuncDialect, mlir::arith::ArithDialect>();
+    }
+private:
+    void runOnOperation() final;
+};
+
+}
+
+void NyaZyToLLVMPass::runOnOperation() {
+    mlir::ConversionTarget target(getContext());
+    target.addLegalDialect<mlir::BuiltinDialect, mlir::LLVM::LLVMDialect>();
+    target.addIllegalDialect<nyacc::NyaZyDialect>();
+
+    mlir::RewritePatternSet patterns(&getContext());
+    // nyazy -> arith + func
+    patterns.add<ConstantOpLowering, FuncOpLowering, ReturnOpLowering>(&getContext());
+
+    // * -> llvm
+    mlir::LLVMTypeConverter typeConverter(&getContext());
+    mlir::arith::populateArithToLLVMConversionPatterns(typeConverter,patterns);
+    mlir::populateFuncToLLVMConversionPatterns(typeConverter, patterns);
+
+    if (failed(applyFullConversion(getOperation(), target, std::move(patterns)))) {
+        signalPassFailure();
+    }
+}
+
+std::unique_ptr<mlir::Pass> nyacc::createNyaZyToLLVMPass() {
+    return std::make_unique<NyaZyToLLVMPass>();
+}
+```
