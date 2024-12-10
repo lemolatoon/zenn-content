@@ -186,7 +186,7 @@ entry:
 実際にフロントエンドを作る際は、プログラミング言語のソースコード文字列をパースし、木構造にし、その木構造を下りながらLLVM IRの命令を作ってきます。
 
 ## LLVM IRの問題点とMLIR
-LLVM IRはISAの違いを吸収しており、素晴らしいですが、LLVM IRは低レベルすぎるという問題点があります。LLVM IRはcallやaddなどの非常にプリミティブな命令列を定義しています。命令一つ一つはかなりCPUの命令と似ている反転、プログラミング言語からその命令に対応させるのは少し大変です。たとえば、C言語のif文やwhile文を変換しようとするとそこまで単純ではないのが分かると思います。LLVM IRには条件に基づくジャンプと、ラベルでしか分岐を表現できません。[^llvmir-branch] 
+LLVM IRはISAの違いを吸収しており、素晴らしいですが、LLVM IRは低レベルすぎるという問題点があります。LLVM IRはcallやaddなどの非常にプリミティブな命令列を定義しています。命令一つ一つはかなりCPUの命令と似ている反面、プログラミング言語からその命令に対応させるのは少し大変です。たとえば、C言語のif文やwhile文を変換しようとするとそこまで単純ではないのが分かると思います。LLVM IRには条件に基づくジャンプと、ラベルでしか分岐を表現できません。[^llvmir-branch] 
 実際には、ifやwhileなどの制御構造程度なら、各フロントエンドががんばって作ればまだ問題にはならないかもしれません。しかし、近年のモダンな言語では、言語機能が高機能になってきており、LLVM IRの前に、独自にIRを使用するというのが普通となっています。これらの高レイヤIRでは、型解析などの、意味の解析に使われています。せっかくLLVM IR似たような処理を各コンパイラで何回も書かれるのを解決したのに、これでは、再び各コンパイラが、各々似たような機能を開発することになっていまいます。
 
 ![各々の言語が各々にIRを持っている様子](/images/self-made-lang-run-on-gpu/irs.png)
@@ -1065,9 +1065,7 @@ link_directories(${LLVM_BUILD_LIBRARY_DIR})
 # ---------------------------
 
 add_executable(nyacc)
-add_library(NyaZyDialect)
 target_compile_options(nyacc PRIVATE -Wall -Wextra -Werror -fno-rtti)
-target_compile_options(NyaZyDialect PRIVATE -Wall -Wextra -Werror -fno-rtti)
 
 
 include_directories(include)
@@ -1075,9 +1073,6 @@ include_directories(include)
 add_subdirectory(include)
 # includeディレクトリからincludeできるようにする。具体的には、現段階では、lexer.hを読み込めるようにする。
 include_directories(${CMAKE_BINARY_DIR}/include)
-
-add_dependencies(nyacc MLIRNyaZyOpsIncGen)
-add_dependencies(nyacc MLIRNyaZyDialectIncGen)
 
 add_subdirectory(src)
 ```
@@ -1100,7 +1095,6 @@ target_sources(nyacc PRIVATE ${SRC_FILES} ${nyazy_dialect_sources})
 # target_link_libraries(nyacc ${LLVM_LIBS})
 target_link_libraries(nyacc
     PRIVATE
-    NyaZyDialect
     ${dialect_libs}
     ${extension_libs}
     MLIRIR
@@ -1517,3 +1511,481 @@ def ReturnOp : NyaZyOp<"return",
 
 [^mlir-op-semantics]: MLIRでは命令を定義しただけでは、その命令の型を定義しただけで振る舞いはドキュメント以外には現れません。その命令を別の命令に変換して初めてその命令の振る舞いがコード上に間接的に現れます。これはドキュメントで規定する振る舞いと一致すべきですし、ドキュメントが１次情報で仕様となるべきです。
 [^build-at-extraClassDecl]: 原理的には、ここに`build`メソッドを記述することもできると思います。
+
+次にこれらをC++から使うための設定をしていきます。まずは、ODSからC++を使うための部分を記述します。そのためにCMakeの設定ファイルを編集します。
+1. 実行ファイルとその他の部分を`nyacc`、MLIR関係のライブラリの部分を`NyaZyDialect`という名前にすることにします。
+2. `mlir_tablegen`と`add_public_tablegen_target`を使って`ODS`をC++に変換するようにします。
+
+これらを達成するため、`CMakeLists.txt`と`include/CMakeLists.txt`、`include/ir/CMakeLists.txt`を編集します。`mlir_tablegen`は`include/ir/CMakeLists.txt`に記述するためです。またこれから、`src/ir/NyaZyDialect.cpp`、`src/ir/NyaZyOps.cpp`も作成するため、そのファイルたちをコンパイル対象に含めるため、`src/CMakeLists.txt`を編集し、`src/ir/CMakeLists.txt`も新規作成します。
+
+```cmake:CMakeLists.txt
+...
+
+add_executable(nyacc)
+# NyaZyDialectという名前のlibraryを作るようにする
+add_library(NyaZyDialect)
+target_compile_options(nyacc PRIVATE -Wall -Wextra -Werror -fno-rtti)
+# NyaZyDialectというをコンパイルするときのコンパイルオプションを記述
+target_compile_options(NyaZyDialect PRIVATE -Wall -Wextra -Werror -fno-rtti)
+
+
+include_directories(include)
+add_subdirectory(include)
+include_directories(${CMAKE_BINARY_DIR}/include)
+
+# ODSを変換したC++を`add_dependencies`で依存関係に追加
+add_dependencies(nyacc MLIRNyaZyOpsIncGen)
+add_dependencies(nyacc MLIRNyaZyDialectIncGen)
+
+add_subdirectory(src)
+...
+```
+```cmake:include/CMakeLists.txt
+# include/ir/CMakeLists.txtを追加するため
+add_subdirectory(ir)
+```
+`mlir_tablegen`の`-gen-dialect-decls`の引数については、[mlir-tblgen](https://mlir.llvm.org/docs/DefiningDialects/Operations/#run-mlir-tblgen-to-see-the-generated-content)の引数に対応している。`./bin mlir-tblgen --help`か` thirdparty/build/llvm/install/bin/mlir-tblgen --help`でhelpを見れる。
+```cmake:include/ir/CMakeLists.txt
+# 1. LLVM_TARGET_DEFINITIONSで.tdファイルのパスを指定
+# 2. mlir_tablegenで変換する。buildディレクトリにおいて、このCMakeLists.txtのパスに対応する場所に生成される。
+# 3. add_public_tablegen_targetで生成されたC++のライブラリに名前をつけられる。`add_dependencies`でこれをリンクできる。
+message(STATUS "Configuring MLIR TableGen for NyaZyDialect")
+set(LLVM_TARGET_DEFINITIONS NyaZyDialect.td)
+mlir_tablegen(NyaZyDialect.h.inc -gen-dialect-decls)
+mlir_tablegen(NyaZyDialect.cpp.inc -gen-dialect-defs)
+add_public_tablegen_target(MLIRNyaZyDialectIncGen)
+
+message(STATUS "Configuring MLIR TableGen for NyaZyOps")
+set(LLVM_TARGET_DEFINITIONS NyaZyOps.td)
+mlir_tablegen(NyaZyOps.h.inc -gen-op-decls)
+mlir_tablegen(NyaZyOps.cpp.inc -gen-op-defs)
+add_public_tablegen_target(MLIRNyaZyOpsIncGen)
+```
+```cmake:src/CMakeLists.txt
+# src/ir/CMakeLists.txtを読み取るようにする
+add_subdirectory(ir)
+
+# Locate all the .cpp files in the src directory
+set(SRC_FILES
+    main.cpp
+    lexer.cpp
+    ast.cpp
+    parser.cpp
+)
+
+get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
+get_property(extension_libs GLOBAL PROPERTY MLIR_EXTENSION_LIBS)
+
+message(STATUS "nyazy dialect sources: ${nyazy_dialect_sources}")
+# Create an executable for the main project from the source files
+target_sources(nyacc PRIVATE ${SRC_FILES} ${nyazy_dialect_sources})
+
+# Link with necessary libraries (e.g., LLVM, if needed)
+# target_link_libraries(nyacc ${LLVM_LIBS})
+target_link_libraries(nyacc
+    PRIVATE
+    NyaZyDialect
+    ${dialect_libs}
+    ${extension_libs}
+    MLIRIR
+    MLIRParser
+    MLIRPass
+    MLIRDialect 
+    MLIRTranslateLib
+    MLIRSupport
+    MLIRTransforms
+    MLIRLLVMToLLVMIRTranslation
+    MLIRBuiltinToLLVMIRTranslation
+)
+
+mlir_check_link_libraries(nyacc)
+```
+```cmake:src/ir/CMakeLists.txt
+# NyaZyDialectライブラリのソースコードとして、NyaZyDialect.cppとNyaZyOps.cppを足す。
+target_sources(NyaZyDialect PRIVATE
+    NyaZyDialect.cpp
+    NyaZyOps.cpp
+)
+
+target_link_libraries(NyaZyDialect
+    MLIRIR
+    MLIRSupport
+    MLIRDialect
+)
+```
+ODSから生成されたC++を利用するために、`include/ir/NyaZyDialect.h`、`include/ir/NyaZyOps.h`、`src/ir/NyaZyDialect.cpp`、`src/ir/NyaZyOps.cpp`を作成する。`NyaZyDialect.h`、`NyaZyOps.h`では、それぞれ`NyaZyDialect.td`と`NyaZyOps.td`から生成されたクラスや関数の宣言をincludeし、ラッパーとします。`NyaZyDialect.cpp`と`NyaZyOps.cpp`では、宣言したメンバ関数の実装部分などを書きます。
+```cpp:include/ir/NyaZyDialect.h
+#pragma once
+
+// NyaZyDialect.h.incで必要になる宣言は自分でincludeする必要がある
+#include "mlir/Bytecode/BytecodeOpInterface.h"
+#include "mlir/IR/Dialect.h"
+
+// -gen-dialect-declsで生成されたファイル
+#include "ir/NyaZyDialect.h.inc"
+```
+```cpp:include/ir/NyaZyOps.h
+#pragma once
+
+// NyaZyOps.h.incで使われているclassなどを事前にinclude
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Dialect.h"
+#include "mlir/IR/OpDefinition.h"
+#include "mlir/Interfaces/InferTypeOpInterface.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Bytecode/BytecodeOpInterface.h"
+
+#include "mlir/IR/Dialect.h"
+#include "mlir/IR/OpDefinition.h"
+#include "mlir/IR/OpImplementation.h"
+#include "mlir/Interfaces/CastInterfaces.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "mlir/Interfaces/InferIntRangeInterface.h"
+#include "mlir/Interfaces/InferTypeOpInterface.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Interfaces/VectorInterfaces.h"
+#include "mlir/IR/Attributes.h"
+#include "llvm/ADT/StringExtras.h"
+
+#include "mlir/Bytecode/BytecodeOpInterface.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Dialect.h"
+#include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Interfaces/CastInterfaces.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
+
+// NyaZyOps.h.incをincludeするときに警告が出るので、それを一旦ignoreする
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wall"
+#pragma GCC diagnostic ignored "-Wextra"
+
+#define GET_OP_CLASSES
+#include "ir/NyaZyOps.h.inc"
+
+// ignore解除
+#pragma GCC diagnostic pop
+```
+```cpp:src/ir/NyaZYDialect.cpp
+#include "ir/NyaZyDialect.h"
+#include "ir/NyaZyOps.h"
+#include <mlir/IR/OpDefinition.h>
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wall"
+#pragma GCC diagnostic ignored "-Wextra"
+
+// NyaZyDialectの実装の部分を取り込む
+#include "ir/NyaZyDialect.cpp.inc"
+// NyaZyのOperationのうち、実装の部分を取り込む
+#define GET_OP_CLASSES
+#include "ir/NyaZyOps.cpp.inc"
+
+#pragma GCC diagnostic pop
+
+namespace nyacc {
+
+// Dialectのinitializeメンバ関数は実装を与える必要がある
+void NyaZyDialect::initialize() {
+// NyaZyOps.cpp.incをGET_OP_LISTをdefineした状態でincludeすると、Operationの型がリストで得られる。
+// addOperationのgenericsの部分にそのまま渡せる
+    addOperations<
+#define GET_OP_LIST
+#include "ir/NyaZyOps.cpp.inc"
+    >();
+}
+
+} // nyacc
+```
+`src/ir/NyaZyOps.cpp`には、`NyaZyOps.td`で定義してNyaZyDialectのOperationに必要な実装を与えます。`FuncOp::build`は、`NyaZyOps.td`において、`builders`で追加したメンバ関数のオーバーロードに実装を与えています。
+`FuncOp::parse`と`FuncOp::print`は、`hasCustomAssemblyFormat`を`1`にしたために実装を追加する必要があるメンバ関数です。ほぼすべてを`func.func`から取ってきているので、解説は省略しますが、MLIRのソースコードとして表示するときに、関数っぽく表示するためのprint方法とparse方法を規定しています。
+```cpp:src/ir/NyaZyOps.cpp
+#include "ir/NyaZyOps.h"
+#include "mlir/IR/Attributes.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Interfaces/FunctionImplementation.h"
+#include "mlir/IR/DialectImplementation.h"
+
+namespace nyacc {
+
+void FuncOp::build(mlir::OpBuilder &builder, mlir::OperationState &state,
+                   llvm::StringRef name, mlir::FunctionType type,
+                   llvm::ArrayRef<mlir::NamedAttribute> attrs) {
+  // FunctionOpInterface provides a convenient `build` method that will populate
+  // the state of our FuncOp, and create an entry block.
+  buildWithEntryBlock(builder, state, name, type, attrs, type.getInputs());
+}
+
+mlir::ParseResult FuncOp::parse(mlir::OpAsmParser &parser,
+                                mlir::OperationState &result) {
+  // Dispatch to the FunctionOpInterface provided utility method that parses the
+  // function operation.
+  auto buildFuncType =
+      [](mlir::Builder &builder, llvm::ArrayRef<mlir::Type> argTypes,
+         llvm::ArrayRef<mlir::Type> results,
+         mlir::function_interface_impl::VariadicFlag,
+         std::string &) { return builder.getFunctionType(argTypes, results); };
+
+  return mlir::function_interface_impl::parseFunctionOp(
+      parser, result, /*allowVariadic=*/false,
+      getFunctionTypeAttrName(result.name), buildFuncType,
+      getArgAttrsAttrName(result.name), getResAttrsAttrName(result.name));
+}
+
+void FuncOp::print(mlir::OpAsmPrinter &p) {
+  // Dispatch to the FunctionOpInterface provided utility method that prints the
+  // function operation.
+  mlir::function_interface_impl::printFunctionOp(
+      p, *this, /*isVariadic=*/false, getFunctionTypeAttrName(),
+      getArgAttrsAttrName(), getResAttrsAttrName());
+}
+
+}
+```
+ここまでで長々とNyaZyDialectとその命令たちを定義してきましたが、ここまでで使えるようになったはずです！
+
+#### ASTからMLIRの世界へ変換する
+ここまでがんばってNyaZyDialectを定義してきたのは、ASTからMLIRへ変換するときの入口となるDialect、すなわちASTと一対一に対応するようなDialectを定義するためです。ここまでで準備できているのでいよいよその変換部分を作成します。その前にASTを定義している`include/ast.h`を再掲します。
+```cpp:include/ast.h
+#pragma once
+
+#include <cstdint>
+#include <memory>
+
+namespace nyacc {
+class Visitor {
+public:
+  virtual ~Visitor() = default;
+  virtual void visit(const class ModuleAST &node) = 0;
+  virtual void visit(const class NumLitExpr &node) = 0;
+};
+
+class ExprASTNode {
+public:
+  enum class ExprKind {
+    NumLit,
+  };
+  explicit ExprASTNode(ExprKind kind) : kind_(kind) {}
+  virtual ~ExprASTNode() = default;
+  virtual void accept(class Visitor &v) = 0;
+  virtual void dump(int level) const = 0;
+  ExprKind getKind() const { return kind_; };
+
+private:
+  ExprKind kind_;
+};
+
+class NumLitExpr : public ExprASTNode {
+public:
+  NumLitExpr(int64_t value) : ExprASTNode(ExprKind::NumLit), value_(value) {}
+
+  void accept(Visitor &v) override { v.visit(*this); }
+  int64_t getValue() const { return value_; }
+
+  static bool classof(const ExprASTNode *node) {
+    return node->getKind() == ExprKind::NumLit;
+  }
+
+  void dump(int level) const override;
+
+private:
+  int64_t value_;
+};
+
+class ModuleAST {
+public:
+  ModuleAST(std::unique_ptr<ExprASTNode> expr) : expr_(std::move(expr)) {}
+  void accept(Visitor &v) const { v.visit(*this); };
+  void dump(int level = 0) const;
+  const std::unique_ptr<ExprASTNode> &getExpr() const { return expr_; }
+
+private:
+  std::unique_ptr<ExprASTNode> expr_;
+};
+} // namespace nyacc
+```
+ここでは、MLIRへは[Visitorパターン](https://ja.wikipedia.org/wiki/Visitor_%E3%83%91%E3%82%BF%E3%83%BC%E3%83%B3)を使います。ある`ExprASTNode&`があったときに、その派生クラスに応じた処理を実行したいとします。これを叶えるのが、Visitorパターンです。まず、そのインスタンスの`ExprASTNode::accept(Visitor &)`を実行します。するとこれは純粋仮想関数なので、各派生クラスで`override`された`accept`が呼ばれることになります。各クラスでは以下のように`override`されています。
+```cpp
+  void accept(Visitor &v) const { v.visit(*this); };
+```
+`*this`の型は派生クラスが`AExpr`であれば`AExpr&`になるし、`BExpr`であれば`BExpr&`、`NumLitExpr`ならば`NumLitExpr&`となります。`Visitor`には、処理する可能性のある型`T`に対して、`void visit(T&)`というオーバーロードを宣言し、その型に応じた実装を提供しておきます。こうすることで、`Visitor`の各`visit`の実装が、そのノード固有の処理となります。
+今回は、`AST`を`ModuleAST`から`accept`をし始め、`MLIR`を生成するような`MLIRGenVisitor`を`Visitor`を継承する形で定義します。
+ここはMLIR生成の肝となるので少し詳細に説明します。
+1. `MLIRGenVisitor::MLIRGenVisitor`（コンストラクタ）
+
+`mlir::MLIRContext`を受け取ってコンストラクトします。`mlir::MLIRContext`は現在生成中のMLIRの状態を保持しているクラスです。これを用いてクラス変数である`mlir::OpBuilder builder_`を初期化しています。`mlir::OpBuilder`はMLIRの命令を作っていくときに使うクラスで、作った命令を挿入すべき位置を内部で保持しています。`mlir::OpBiulder::create<nyacc::ReturnOp>(...)`などとすると、`nyacc::ReturnOp::build`が呼ばれて、命令が作られ、`MLIRContext`に`mlir::OpBuilder`を通して記録されることとなります。
+`mlir::ModuleOp module_`は追加していくMLIRの一番の親となるものです。これは`builder_`を用いて作り、初期化しています。ソースコードのロケーション情報は保持していないので、とりあえず、`builder_.getUnknownLoc()`を使って不明なロケーションとしています。
+`std::optional<mlir::Value> value_`は、直前に作った命令を保持することにしています。`std::optional<T>`は、`T`の値が存在するかしないかという情報を持つことができるようなクラスです。Rustの`Option`のようなものです。`mlir::Value`はmlirにおいて、作成した命令を表すクラスです。`builder_.create`で作成した命令は、`mlir::Value`型の変数に代入できます。まだなんの命令も作成していないので、`std::nullopt`として初期化しています。
+コンストラクタ内では、`setInsertionPointToStart`を使って、`ModuleOp`内の`Body`の中に以後命令を挿入していくように設定しています。
+
+2. `void visit(const nyacc::ModuleAST &moduleAst)`
+
+これは、`ModuleAST`への処理を記述します。具体的には、`ModuleAST`はAST全体のルートなので、この`visit`を起点にASTを走査していきます。
+NyaZyでは、いまのところmain関数は暗黙的に定義され、１つの式を持ち、その式の評価値がexit codeとなるということにしています。main関数からのreturnによる戻り値はexit codeになるので、式を評価してそれをreturnすることにします。main関数になる`nyacc::FuncOp`を作ったら、その中に命令を入れてくように`setInsertionPoint`を呼びます。
+`moduleAST.getExpr()->accept`で唯一の式を走査します。今のところは確定で`void visit(const nyacc::NumLitExpr &numLit)`を間接的に呼ぶことになります。`ExprASTNode`に対するaccept、すなわちvisitは、`value_`にその式を評価する命令の最後の値を入れておくことにしているので、
+`value_.value()`で取り出し、それを引数として`nyacc::ReturnOp`を作っています。
+
+3. `void visit(const nyacc::NumLitExpr &numLit)`
+
+整数定数を、`nyacc::ConstantOp`を使って`mlir::Value`にしています。式に対するvisitなので、その評価した値を`value_`に代入しています。
+
+4. `mlir::OwningOpRef<mlir::ModuleOp> MLIRGen::gen(mlir::MLIRContext &context, const ModuleAST &moduleAst)`
+
+`mlir::OwningOpRef`は`std::unique_ptr`みたいなやつです。これは、`MLIRGenVisitor`を使うときのpublicなAPIになっています。
+
+```cpp:src/mlirGen.cpp
+#include "mlirGen.h"
+#include "ast.h"
+#include "ir/NyaZyDialect.h"
+#include "ir/NyaZyOps.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include <mlir/Dialect/Func/IR/FuncOps.h>
+
+namespace {
+
+class MLIRGenVisitor : public nyacc::Visitor {
+public:
+  MLIRGenVisitor(mlir::MLIRContext &context)
+      : builder_(&context),
+        module_(mlir::ModuleOp::create(builder_.getUnknownLoc())),
+        value_(std::nullopt) {
+    builder_.setInsertionPointToStart(module_.getBody());
+  }
+
+  mlir::OwningOpRef<mlir::ModuleOp> takeModule() { return std::move(module_); }
+
+  void visit(const nyacc::ModuleAST &moduleAst) override {
+    auto mainOp = builder_.create<nyacc::FuncOp>(
+        builder_.getUnknownLoc(), "main", builder_.getFunctionType({}, {}));
+
+    builder_.setInsertionPointToStart(&mainOp.front());
+    moduleAst.getExpr()->accept(*this);
+    builder_.create<nyacc::ReturnOp>(builder_.getUnknownLoc(), value_.value());
+  }
+
+  void visit(const nyacc::NumLitExpr &numLit) override {
+    value_ = builder_.create<nyacc::ConstantOp>(
+        builder_.getUnknownLoc(),
+        builder_.getI64IntegerAttr(numLit.getValue()));
+  }
+
+private:
+  mlir::OpBuilder builder_;
+  mlir::ModuleOp module_;
+  std::optional<mlir::Value> value_;
+};
+
+} // namespace
+
+namespace nyacc {
+
+mlir::OwningOpRef<mlir::ModuleOp> MLIRGen::gen(mlir::MLIRContext &context,
+                                               const ModuleAST &moduleAst) {
+  MLIRGenVisitor visitor{context};
+  moduleAst.accept(visitor);
+  return visitor.takeModule();
+}
+
+} // namespace nyacc
+```
+
+:::details `builder_.create`を使いこなすコツ
+
+これはコードの解説ではないですが、`builder_.create<Op>`の引数の候補は普通のLSPの補完ではでてこないので、`Op::build`がどんなオーバーロードになっているのかを把握する必要があります。`build/compile_commands.json`をclangdなどに読み込んであげれば定義ジャンプが効くはずなので、`Op`にカーソルをあわせて定義ジャンプすることで、ODSによって生成されたC++ファイルにジャンプするはずです。そこで`Op::build`の宣言を探し、それを参考に`builder_.create<Op>`を呼ぶようにするとうまくいくことが多いです。C++のエラーは難解なので、エラーになったときは冷静にどの呼び出しでエラーになっているのかを探りましょう。
+:::
+
+これで以下のような流れまで実装できたはずです。
+```mermaid
+graph TD;
+  A[ソースコード] --> |tokenize| B[トークン列]
+	B --> |parse| C[AST]
+  C --> |MLIRGen| D[MLIR （NyaZyDialect）]
+```
+
+それでは実際に`src/main.cpp`に`MLIRGen`の部分を足して試してみましょう。
+```cpp:src/main.cpp
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinDialect.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/Verifier.h"
+#include <iostream>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/raw_ostream.h>
+#include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Pass/Pass.h>
+#include <mlir/Pass/PassManager.h>
+#include <mlir/Pass/PassRegistry.h>
+#include <mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h>
+#include <mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h>
+#include <mlir/Target/LLVMIR/Export.h>
+
+#include "ast.h"
+#include "lexer.h"
+#include "mlirGen.h"
+#include "parser.h"
+
+#include "ir/NyaZyDialect.h"
+#include "ir/NyaZyOps.h"
+#include "ir/Pass.h"
+
+int main() {
+  std::string src = R"(
+123
+)";
+  llvm::outs() << "Source code:\n";
+  llvm::outs() << src;
+  nyacc::Lexer lexer("123");
+  llvm::outs() << "Tokens:\n";
+  const auto tokens = lexer.tokenize();
+  for (const auto &token : tokens) {
+    std::cout << token << "\n";
+  }
+  nyacc::Parser parser{tokens};
+  auto moduleAst = parser.parseModule();
+  llvm::outs() << "AST:\n";
+  moduleAst.dump();
+
+  mlir::MLIRContext context;
+  // NyaZyDialectをcontextにload、使うDialectは事前にロードする必要がある。今のところはNyaZyDialectだけ。
+  context.getOrLoadDialect<nyacc::NyaZyDialect>();
+  // 先ほど実装したMLIRGenVisitorを使うためのpublic API
+  auto module = nyacc::MLIRGen::gen(context, moduleAst);
+  llvm::outs() << "MLIR:\n";
+  // MLIRの命令は`dump`を呼ぶとデバッグ出力が見れる。
+  module->dump();
+
+  if (mlir::failed(mlir::verify(*module))) {
+    llvm::errs() << "Module verification failed.\n";
+    return 1;
+  }
+
+  return 0;
+}
+
+```
+それでは実行してみます。うまくいけば以下のような、MLIRが見られるはずです。
+```bash
+$ ./bin build
+$ ./bin nyacc
+...
+MLIR:
+module {
+  nyazy.func @main() {
+    %0 = nyazy.constant 123 : i64
+    "nyazy.return"(%0) : (i64) -> ()
+  }
+}
+```
+
+#### NyaZyDialectからLLVM Dialectへと変換する
