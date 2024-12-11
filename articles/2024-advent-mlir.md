@@ -2019,7 +2019,12 @@ graph TD;
 
 1. `nyazy.return`と`nyazy.constant`の変換
 
-ある命令に対して一律に変換するときは、`mlir::OpConversionPattern`を継承して、`matchAndRewrite`を使うことで実現できます。第１引数にもとの命令、第３引数に`mlir::ConversionPatternRewriter`というものを受け取ります。`rewriter`を使って命令を追加できる。また、`rewriter.erase`とすると、下の命令を消すことができるし、`rewriter.replaceOp`を使うと、置き換えることもできる。
+ある命令に対して一律に変換を試みるときは、`mlir::OpConversionPattern`を継承して、`matchAndRewrite`を使うことで実現できます。第１引数にもとの命令、第３引数に`mlir::ConversionPatternRewriter`というものを受け取ります。`rewriter`を使うと、`mlir::Builder`と同じように、`rewriter.create`で命令を追加できます。また、`rewriter.erase`とすると、下の命令を消すことができるし、`rewriter.replaceOp`を使うと、置き換えることもできます。
+`nyazy.return`と`nyazy.constant`は、`func.return`と`arith.constant`を完全に真似したため、それぞれのオペランドを維持しながら命令をすり替えても意味的にも型的にも大丈夫です。
+`class ConstantOpLowering`では、`rewriter.replaceOp`を使っています。古い命令（`nyazy.constant`）と新しく`rewriter.create`で作った命令（`arith.constant`）を入れ替えます。`constantOp`のロケーション情報と、オペランドを、`rewriter.create`時にわたすことで、すり替えることができます。もとの命令は自動的に削除されます。
+`class ReturnOpLowering`では、`rewriter.replaceOpWithNewOp`を使っています。この関数を使うと、`create`と`replaceOp`を同時済ますことができます。
+
+2. `nyazy.func`から`func.func`への変換
 ```cpp:src/ir/lowerToLLVM.cpp
 #include "ir/NyaZyDialect.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -2138,3 +2143,10 @@ std::unique_ptr<mlir::Pass> nyacc::createNyaZyToLLVMPass() {
     return std::make_unique<NyaZyToLLVMPass>();
 }
 ```
+
+:::details MLIRの関数たちを使いこなすコツ
+MLIRやLLVMを使いこなす上で個人的に重要だと感じているのは、IDEやVSCodeの設定をしっかりして補完を効かせるようにするということです。補完の設定をちゃんとしておくことで、とりあえず知らないクラスに対しても`.`を売って候補の関数名と引数の型などを見てなんとなくどんなことができるのかを予想することができます。もちろん、クラスのドキュメントなど（[例](https://mlir.llvm.org/doxygen/classmlir_1_1PatternRewriter.html)）は公開されていますが、エディタ上で見えたほうが圧倒的に便利です。`auto`の型なども`inlayHints`で表示させておく便利です。
+
+![補完が出ている様子](/images/2024-advent-mlir/vscode-hokan-daiji.png)
+*補完が出ている様子*
+:::
