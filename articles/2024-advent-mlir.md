@@ -2009,10 +2009,10 @@ graph TD;
 ```mermaid
 graph TD;
     A[nyazy] --> B[arith]
-    A[nyazy] --> F[func]
+    A[nyazy] --> C[func]
 
-    B[arith] --> G[llvm]
-    F[func] --> G[llvm]
+    B[arith] --> D[llvm]
+    C[func] --> D[llvm]
 ```
 `nyazy.func`は、[func.func](https://mlir.llvm.org/docs/Dialects/Func/#funcfunc-funcfuncop)に、`nyazy.return`は[func.return](https://mlir.llvm.org/docs/Dialects/Func/#funcreturn-funcreturnop)にマッピングし、`nyazy.constant`は[arith.constant](https://mlir.llvm.org/docs/Dialects/ArithOps/#arithconstant-arithconstantop)にマッピングします。
 `src/ir/lowerToLLVM.cpp`にこの変換を書いていきます。
@@ -2025,6 +2025,12 @@ graph TD;
 `class ReturnOpLowering`では、`rewriter.replaceOpWithNewOp`を使っています。この関数を使うと、`create`と`replaceOp`を同時済ますことができます。
 
 2. `nyazy.func`から`func.func`への変換
+
+あらかたは[toy tutorialのFuncOpLowering](https://github.com/llvm/llvm-project/blob/331c2dd8b482e441d8ccddc09f21a02cc9454786/mlir/examples/toy/Ch7/mlir/LowerToAffineLoops.cpp#L222)を参考にほぼパクっています。やっていることは、以下のことです。
+  * `main`関数であること、引数が０個であることを確認します。
+  * `func.func`を`rewriter.create`で作成します。ロケーション情報と関数名は、`nyazy.func`から持ってきます。
+  * `func.func`の中身の命令たちを、`nyazy.func`のRegionをコピーしてきます。`rewriter.inlineRegionBefore`を使っています。
+  * `rewriter.eraseOp`で`nyazy.func`を削除します。
 ```cpp:src/ir/lowerToLLVM.cpp
 #include "ir/NyaZyDialect.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -2084,8 +2090,6 @@ struct FuncOpLowering : public mlir::OpConversionPattern<nyacc::FuncOp> {
   mlir::LogicalResult
   matchAndRewrite(nyacc::FuncOp op, OpAdaptor adaptor [[maybe_unused]],
                   mlir::ConversionPatternRewriter &rewriter) const final {
-    // We only lower the main function as we expect that all other functions
-    // have been inlined.
     if (op.getName() != "main")
       return mlir::failure();
 
@@ -2143,6 +2147,19 @@ std::unique_ptr<mlir::Pass> nyacc::createNyaZyToLLVMPass() {
     return std::make_unique<NyaZyToLLVMPass>();
 }
 ```
+```cpp:include/ir/Pass.h
+#include <memory>
+
+namespace mlir {
+class Pass;
+};
+
+namespace nyacc {
+
+std::unique_ptr<mlir::Pass> createNyaZyToLLVMPass();
+
+} // nyacc
+```
 
 :::details MLIRの関数たちを使いこなすコツ
 MLIRやLLVMを使いこなす上で個人的に重要だと感じているのは、IDEやVSCodeの設定をしっかりして補完を効かせるようにするということです。補完の設定をちゃんとしておくことで、とりあえず知らないクラスに対しても`.`を売って候補の関数名と引数の型などを見てなんとなくどんなことができるのかを予想することができます。もちろん、クラスのドキュメントなど（[例](https://mlir.llvm.org/doxygen/classmlir_1_1PatternRewriter.html)）は公開されていますが、エディタ上で見えたほうが圧倒的に便利です。`auto`の型なども`inlayHints`で表示させておく便利です。
@@ -2150,3 +2167,170 @@ MLIRやLLVMを使いこなす上で個人的に重要だと感じているのは
 ![補完が出ている様子](/images/2024-advent-mlir/vscode-hokan-daiji.png)
 *補完が出ている様子*
 :::
+
+それぞれの命令の変換部分の実装はここまででできました。MLIRでは、命令の変換のまとまりをパスとして定義します。パスを表す基底クラスは、`mlir::Pass`です。今回は、Toy DialectをLLVM Dialectへと変換するパスを`NyaZyToLLVMPass`として宣言します。
+パスを定義するときは、`mlir::PassWrapper`を継承することで、簡単に定義できます。`getDependentDialects`では、そのパスで使うDialectを`registry.insert`します。こうすることで、このパスが適用されるときに、自動的にこのDialectたちがロードされます。
+
+`NyaZyDialect::runOnOperation`に実際のパスの実装をしていきます。パスに際して、まず`mlir::ConversionTarget`を宣言し、このパスで完全に変換されるべき`IllegalDialect`と、変換先として許される`LegalDialect`というものを登録します。これのより、このパスでどのDialectを目指してどのDialectを変換するのかを表します。実際、この指定によってパスの動作が変わってきます。
+また、`mlir::RewritePatternSet`に、実際に変換パターンを登録していきます。まずは、`{ConstantOp, FuncOp, ReturnOp}Lowering`をそれぞれ、`patterns.add`で登録します。ここまでで、Toy Dialectが、Func DialectとArith Dialectに変換されているはずです。
+
+ここからは、MLIRが提供している変換パターンを登録していきます。LLVM Dialectへと変換するときは、`mlir::LLVMTypeConverter`も定義します。これは、MLIR標準の型からLLVM Dialectの型へのマッピングを提供します。
+`mlir::arith::populateArithToLLVMConversionPatterns(typeConverter,patterns)`で、Arith DialectからLLVM Dialectへの変換を登録します。`mlir::populateFuncToLLVMConversionPatterns(typeConverter, patterns)`で、Func DialectからLLVM Dialectへの変換を登録します。
+
+再掲ですが、以下のグラフがこのパスを完全に表しています。
+```mermaid
+graph TD;
+    A[nyazy] --> B[arith]
+    A[nyazy] --> C[func]
+
+    B[arith] --> D[llvm]
+    C[func] --> D[llvm]
+```
+
+最後に、`createNyaZyToLLVMPass`を定義して、これをpublicなAPIとしています。
+
+いよいよようやくLLVM Dialectまで変換する準備ができました。`src/main.cpp`に追記して試してみましょう！
+`mlir::PassManager`は複数のパスを登録してそれを順番に適用していくことができるものです。`pm.addPass`でパスを登録し、`pm.run`で登録したパスを順番に適用します。 
+`mlir::failed`というのは、`mlir::Result`をとり、失敗なら`true`を返します。
+
+パスの適用が終わり、LLVM DialectのみからなるMLIRが得られたら、あとはMLIRの言葉で記述されたLLVM IRをLLVMの言葉で記述されたLLVM IRに変換できます。これには `mlir::translateModuleToLLVMIR` を使います。これにより、`mlir::ModuleOp`を`llvm::Module`に変換できます。
+`llvmModule->print`で標準出力にダンプします。
+```cpp:src/main.cpp
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinDialect.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/Verifier.h"
+#include <iostream>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/raw_ostream.h>
+#include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Pass/Pass.h>
+#include <mlir/Pass/PassManager.h>
+#include <mlir/Pass/PassRegistry.h>
+#include <mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h>
+#include <mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h>
+#include <mlir/Target/LLVMIR/Export.h>
+
+#include "ast.h"
+#include "lexer.h"
+#include "mlirGen.h"
+#include "parser.h"
+
+#include "ir/NyaZyDialect.h"
+#include "ir/NyaZyOps.h"
+#include "ir/Pass.h"
+
+int main() {
+  std::string src = R"(
+123
+)";
+  llvm::outs() << "Source code:\n";
+  llvm::outs() << src;
+  nyacc::Lexer lexer("123");
+  llvm::outs() << "Tokens:\n";
+  const auto tokens = lexer.tokenize();
+  for (const auto &token : tokens) {
+    std::cout << token << "\n";
+  }
+  nyacc::Parser parser{tokens};
+  auto moduleAst = parser.parseModule();
+  llvm::outs() << "AST:\n";
+  moduleAst.dump();
+
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<nyacc::NyaZyDialect>();
+  context.getOrLoadDialect<mlir::arith::ArithDialect>();
+  context.getOrLoadDialect<mlir::LLVM::LLVMDialect>();
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  auto module = nyacc::MLIRGen::gen(context, moduleAst);
+  llvm::outs() << "MLIR:\n";
+  module->dump();
+
+  if (mlir::failed(mlir::verify(*module))) {
+    llvm::errs() << "Module verification failed.\n";
+    return 1;
+  }
+
+  mlir::PassManager pm(&context);
+  pm.addPass(nyacc::createNyaZyToLLVMPass());
+
+  if (mlir::failed(pm.run(*module))) {
+    llvm::errs() << "Failed to lower to LLVM IR\n";
+    return 1;
+  }
+
+  llvm::outs() << "Lowered MLIR:\n";
+  module->dump();
+
+  if (mlir::failed(mlir::verify(*module))) {
+    llvm::errs() << "Module verification failed.\n";
+    return 1;
+  }
+
+  // Convert the MLIR module to LLVM IR
+  mlir::registerBuiltinDialectTranslation(*module->getContext());
+  mlir::registerLLVMDialectTranslation(*module->getContext());
+  llvm::LLVMContext llvmContext;
+  auto llvmModule = mlir::translateModuleToLLVMIR(*module, llvmContext);
+
+  if (!llvmModule) {
+    llvm::errs() << "Failed to emit LLVM IR\n";
+    return 1;
+  }
+  llvm::outs() << "Generated LLVM IR:\n";
+  llvmModule->print(llvm::outs(), nullptr);
+
+  return 0;
+}
+```
+それではこれを実行してみましょう。
+```bash
+$ ./bin build
+$ ./bin nyacc
+Source code:
+
+123
+Tokens:
+Token(NumLit, 123)
+AST:
+ModuleAST
+ NumLitExpr(123)
+MLIR:
+module {
+  nyazy.func @main() {
+    %0 = nyazy.constant 123 : i64
+    "nyazy.return"(%0) : (i64) -> ()
+  }
+}
+Lowered MLIR:
+module {
+  llvm.func @main() -> i64 {
+    %0 = llvm.mlir.constant(123 : i64) : i64
+    llvm.return %0 : i64
+  }
+}
+Generated LLVM IR:
+; ModuleID = 'LLVMDialectModule'
+source_filename = "LLVMDialectModule"
+
+define i64 @main() {
+  ret i64 123
+}
+```
+NyaZy Dialectで記述されていたMLIRが変換されて、`llvm.func`, `llvm.mlir.constant`, `llvm.return`というLLVM Dialectのみで記述されたものになっているのが確認できます。さらに、それを変換したLLVM IRも確認できます。
+`Generated LLVM IR:`と書かれた行より下の部分をコピーし、`tmp.ll`に保存して`lli`を使って実行してみましょう。bashの場合は`$?`、fishの場合は、`$status`で前のコマンドのexit codeを確認できます。
+```bash
+$ ./bin lli tmp.ll
+# bashの場合
+$ echo $?
+123
+# fishの場合
+$ echo $status
+123
+```
