@@ -2334,3 +2334,194 @@ $ echo $?
 $ echo $status
 123
 ```
+
+### Step3 四則演算ができるようにする
+[該当コミット](https://github.com/lemolatoon/NyaZy/commit/6e97d195ccd164736f0d4e42abb524f1eb36ebba) [差分プルリクエスト](https://github.com/lemolatoon/NyaZy/pull/2)
+
+```bash
+$ git checkout 6e97d195ccd164736f0d4e42abb524f1eb36ebba
+```
+
+Step2では、ただ整数を読んで、それがコンパイル出力のプログラムのexit codeになるだけでした。Step3では、より言語処理系っぽく、四則演算で表された式を計算してexit codeにするような言語をコンパイルすることを目指します。
+```rust:sample.nz
+// 実行時にこれが計算されて、exit codeが14になる。
+2+4*(2+1)
+```
+
+コンパイラに新しい機能を追加するときは、Lexer、Parser、mlirgen、mlirのパス、それぞれに少しずつ手を加える必要があります。
+```mermaid
+graph TD;
+    A[Source Code] -->|Lexer| B[Tokens]
+    B -->|Parser| C[AST]
+    C -->|MLIRGen| D[Only NyaZy Dialect MLIR]
+    D -->|MLIR Passes| E[Only LLVM Dialect MLIR]
+```
+#### Lexer: 演算子とカッコのTokenを追加する
+まずはLexerに手を加えるので、`include/lexer.h`と`src/lexer.cpp`を編集していきます。
+
+`include/lexer.h`では、Tokenの種類を表していた`enum class TokenKind`にバリアントを増やしています。`tokenKindToString`のswitch caseも増やしています。 四則演算の演算子と、カッコ開け、閉じです。`Token`は、ソースコード文字列の該当部分への`std::string_view`と、トークンの種類のみを持っているので、宣言部分はこれで十分です。
+```cpp:include/lexer.h
+#pragma once
+
+#include <string_view>
+#include <vector>
+
+namespace nyacc {
+class Token {
+public:
+  enum class TokenKind {
+    NumLit,
+    // 追加トークン start =============
+    Plus, // +
+    Minus, // -
+    Star, // *
+    Slash, // /
+    OpenParen, // (
+    CloseParen, // )
+    // 追加トークン end =============
+    Eof,
+  };
+  static const char *tokenKindToString(TokenKind kind) {
+    switch (kind) {
+    case TokenKind::NumLit:
+      return "NumLit";
+    case TokenKind::Plus:
+      return "Plus";
+    case TokenKind::Minus:
+      return "Minus";
+    case TokenKind::Star:
+      return "Star";
+    case TokenKind::Slash:
+      return "Slash";
+    case TokenKind::OpenParen:
+      return "OpenParen";
+    case TokenKind::CloseParen:
+      return "CloseParen";
+    case TokenKind::Eof:
+      return "Eof";
+    }
+  }
+  // 他のメンバ関数の宣言
+
+private:
+  TokenKind kind_;
+  std::string_view text_;
+};
+
+// class Lexerの宣言が続く...
+} // namespace nyacc
+```
+
+`src/lexer.cpp`については、`Lexer::tokenize`に関係のある部分のみ載せます。`input_`がソースコードの文字列を表していて、`pos_`が次のトークナイズ位置を示しているので、これが`input_.size()`より小さい間だけ`while`文でループしています。追加したトークンはすべて一文字なので、`if`文で判定して、`tokens`に`emplace_back`していきます。空白と改行は単に読み飛ばしています。（冗長な書き方ですが、のちのステップでまとめます。）
+```cpp:src/lerxer.cpp
+#include "lexer.h"
+#include <cctype>
+#include <iostream>
+
+namespace nyacc {
+
+std::string_view Lexer::head() { return input_.substr(pos_); }
+std::vector<Token> Lexer::tokenize() {
+  std::vector<Token> tokens;
+
+  while (pos_ < input_.size()) {
+    // tokenize integer
+    if (std::isdigit(input_[pos_])) {
+      const auto start_pos = pos_;
+      while (std::isdigit(input_[pos_])) {
+        if (start_pos == pos_ && input_[pos_] == '0') {
+          pos_++;
+          break;
+        }
+        pos_++;
+      }
+      std::string_view num_lit = input_.substr(start_pos, pos_ - start_pos);
+      tokens.emplace_back(Token::TokenKind::NumLit, num_lit);
+      continue;
+    }
+
+    if (input_[pos_] == ' ' || input_[pos_] == '\n') {
+      pos_++;
+      continue;
+    }
+
+    // tokenize plus
+    if (input_[pos_] == '+') {
+      tokens.emplace_back(Token::TokenKind::Plus, "+");
+      pos_++;
+      continue;
+    }
+
+    // tokenize minus
+    if (input_[pos_] == '-') {
+      tokens.emplace_back(Token::TokenKind::Minus, "-");
+      pos_++;
+      continue;
+    }
+
+    // tokenize mul
+    if (input_[pos_] == '*') {
+      tokens.emplace_back(Token::TokenKind::Star, "*");
+      pos_++;
+      continue;
+    }
+
+    // tokenize slash
+    if (input_[pos_] == '/') {
+      tokens.emplace_back(Token::TokenKind::Slash, "/");
+      pos_++;
+      continue;
+    }
+
+    // tokenize (
+    if (input_[pos_] == '(') {
+      tokens.emplace_back(Token::TokenKind::OpenParen, "(");
+      pos_++;
+      continue;
+    }
+    // tokenize (
+    if (input_[pos_] == ')') {
+      tokens.emplace_back(Token::TokenKind::CloseParen, ")");
+      pos_++;
+      continue;
+    }
+  }
+
+  return tokens;
+}
+
+} // namespace nyacc
+```
+`src/main.cpp`のソースコードを変更して、パーサーをテストしてみましょう。
+```cpp:src/main.cpp
+int main() {
+  std::string src = R"(
+2+4*(2+1)
+)";
+  llvm::outs() << "Source code:\n";
+  llvm::outs() << src;
+  nyacc::Lexer lexer(src);
+  llvm::outs() << "Tokens:\n";
+  const auto tokens = lexer.tokenize();
+  for (const auto &token : tokens) {
+    std::cout << token << "\n";
+  }
+}
+```
+```bash
+$ ./bin build
+$ ./bin nyacc
+Source code:
+
+2+4*(2+1)
+Tokens:
+Token(NumLit, 2)
+Token(Plus, +)
+Token(NumLit, 4)
+Token(Star, *)
+Token(OpenParen, ()
+Token(NumLit, 2)
+Token(Plus, +)
+Token(NumLit, 1)
+Token(CloseParen, ))
+```
