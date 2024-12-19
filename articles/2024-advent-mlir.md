@@ -2487,6 +2487,8 @@ std::vector<Token> Lexer::tokenize() {
     }
   }
 
+  // 最後にEofを足すようにする
+  tokens.emplace_back(Token::TokenKind::Eof, "");
   return tokens;
 }
 
@@ -2524,4 +2526,304 @@ Token(NumLit, 2)
 Token(Plus, +)
 Token(NumLit, 1)
 Token(CloseParen, ))
+Token(Eof, )
 ```
+
+#### Parser: 和差と積商のASTを追加する
+
+アウトラインとしては、`include/ast.h`、`src/ast.cpp`を修正し、演算に対応するノードを定義します。その後、`include/parser.h`と`src/parser.cpp`を修正し、トークン列から追加したノードへのパース部分の実装を追加します。
+パースするときには、演算子の優先順位を考える必要があります。具体的には、優先順位が低い順にパースしていくことで、望んだASTが得られます。たとえば、`1 + 2 * 3`を考えるとき、まずは、`Expr + Expr`からパースすることで、`(1) + (2 * 3)`として見たあと、`Expr * Expr`をパースすることで、`(1) + ((2) * (3))`となります。（ここでは、カッコで囲んだ整数をパースしたExprとしてみなしています。）
+
+まずは、ノードを足していきます。`BinaryExpr`は、二項演算式全般を表すクラスです。`enum class BinaryOp`を内部で持っており、これが演算を表しています。今のところは、四則演算のみです。
+```cpp:include/ast.h
+#pragma once
+
+#include <cstdint>
+#include <memory>
+
+namespace nyacc {
+class Visitor {
+public:
+  virtual ~Visitor() = default;
+  virtual void visit(const class ModuleAST &node) = 0;
+  virtual void visit(const class NumLitExpr &node) = 0;
+  // 追加！
+  virtual void visit(const class BinaryExpr &node) = 0;
+};
+
+enum class BinaryOp {
+  Add,
+  Sub,
+  Mul,
+  Div,
+};
+
+static inline const char *BinaryOpToStr(BinaryOp op) {
+  switch (op) {
+  case BinaryOp::Add:
+    return "+";
+  case BinaryOp::Sub:
+    return "-";
+  case BinaryOp::Mul:
+    return "*";
+  case BinaryOp::Div:
+    return "/";
+    break;
+  }
+}
+
+class BinaryExpr : public ExprASTNode {
+public:
+  BinaryExpr(std::unique_ptr<ExprASTNode> lhs, std::unique_ptr<ExprASTNode> rhs,
+             BinaryOp op)
+      : ExprASTNode(ExprKind::Binary), lhs_(std::move(lhs)),
+        rhs_(std::move(rhs)), op_(op) {}
+  void accept(Visitor &v) override { v.visit(*this); }
+
+  static bool classof(const ExprASTNode *node) {
+    return node->getKind() == ExprKind::Binary;
+  }
+
+  void dump(int level) const override;
+  const std::unique_ptr<ExprASTNode> &getLhs() const { return lhs_; }
+  const std::unique_ptr<ExprASTNode> &getRhs() const { return rhs_; }
+  const BinaryOp &getOp() const { return op_; }
+
+private:
+  std::unique_ptr<ExprASTNode> lhs_;
+  std::unique_ptr<ExprASTNode> rhs_;
+  BinaryOp op_;
+};
+```
+```cpp:include/ast.cpp
+#include "ast.h"
+#include <iostream>
+
+namespace nyacc {
+void BinaryExpr::dump(int level) const {
+  std::cout << std::string(level * 2, ' ') << "BinaryExpr(\n";
+  lhs_->dump(level + 1);
+  // print binary op
+  std::cout << std::string((level + 1) * 2, ' ') << BinaryOpToStr(op_) << "\n";
+  rhs_->dump(level + 1);
+  std::cout << std::string(level * 2, ' ') << ")\n";
+}
+} // namespace nyacc
+```
+パーサーも追加していきます。先程説明したように、まずは和差部分をパースし、次に積商部分をパースします。
+```cpp:include/parser.h
+#pragma once
+
+#include "ast.h"
+#include "lexer.h"
+
+namespace nyacc {
+class Parser {
+public:
+  Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)), pos_(0) {}
+
+  ModuleAST parseModule();
+
+private:
+  // 和と差
+  std::unique_ptr<ExprASTNode> parseExpr();
+  // 積と商
+  std::unique_ptr<ExprASTNode> parseMul();
+  // 数字、カッコで囲まれた式
+  std::unique_ptr<ExprASTNode> parsePrimary();
+  std::vector<Token> tokens_;
+  size_t pos_{0};
+};
+} // namespace nyacc
+```
+```cpp:src/parser.cpp
+#include "parser.h"
+#include "ast.h"
+#include <charconv>
+#include <iostream>
+#include <memory>
+
+namespace nyacc {
+
+ModuleAST Parser::parseModule() {
+  auto expr = parseExpr();
+  return ModuleAST(std::move(expr));
+}
+
+std::unique_ptr<ExprASTNode> Parser::parseExpr() {
+  // まずは左辺をパース
+  std::unique_ptr<ExprASTNode> node = parseMul();
+
+  while (true) {
+    const auto &token = tokens_[pos_];
+    // 演算子をチェック
+    switch (token.getKind()) {
+    case Token::TokenKind::Plus:
+    case Token::TokenKind::Minus: {
+      pos_++;
+      // 右辺
+      auto rhs = parseMul();
+      BinaryOp op = token.getKind() == Token::TokenKind::Plus ? BinaryOp::Add
+                                                              : BinaryOp::Sub;
+      // 左辺と右辺を合わせて、これを次の左辺とする。
+      node = std::make_unique<BinaryExpr>(std::move(node), std::move(rhs), op);
+      continue;
+    }
+    default:
+      return node;
+    }
+  }
+}
+
+std::unique_ptr<ExprASTNode> Parser::parseMul() {
+  std::unique_ptr<ExprASTNode> node = parsePrimary();
+  while (true) {
+    const auto &token = tokens_[pos_];
+    switch (token.getKind()) {
+    case Token::TokenKind::Star:
+    case Token::TokenKind::Slash: {
+      pos_++;
+      auto rhs = parseMul();
+      BinaryOp op = token.getKind() == Token::TokenKind::Star ? BinaryOp::Mul
+                                                              : BinaryOp::Div;
+      node = std::make_unique<BinaryExpr>(std::move(node), std::move(rhs), op);
+      continue;
+    }
+    default:
+      return node;
+    }
+  }
+  return node;
+}
+
+std::unique_ptr<ExprASTNode> Parser::parsePrimary() {
+  const auto &token = tokens_[pos_];
+  switch (token.getKind()) {
+  case Token::TokenKind::NumLit: {
+    int64_t result = 0;
+    auto [ptr, ec] = std::from_chars(
+        token.text().data(), token.text().data() + token.text().size(), result);
+    if (ec == std::errc()) {
+      pos_++;
+      return std::make_unique<NumLitExpr>(result);
+    } else {
+      std::cerr << "Unexpected token: " << token << "\n";
+      std::abort();
+    }
+  }
+  case Token::TokenKind::OpenParen: {
+    pos_++;
+    auto expr = parseExpr();
+    if (tokens_[pos_].getKind() != Token::TokenKind::CloseParen) {
+      std::cerr << "Expected ')'\n";
+      std::abort();
+    }
+    pos_++;
+    return expr;
+  }
+  default:
+    std::cerr << "Unexpected token: " << token << "\n";
+    std::abort();
+    break;
+  }
+}
+
+} // namespace nyacc
+```
+このパーサーはうまく再帰を利用しています。まずは、左辺をパースした後、右辺をパースし、これを演算子がなくなるまでパースします。たとえば、`1 + 2 + 3 + 4`なら、`(((1 + 2) + 3) + 4)`のように解釈されます。
+`parsePrimary`では、カッコの処理もしています。`(`を見つけたら、次に式をパースし、その後は`)`が来ているはずです。
+
+`MLIRGen`に空のvisitを追加して、コンパイルが通るようにし、パーサーを試してみましょう。
+```cpp:src/mlirGen.cpp
+  void visit(const nyacc::BinaryExpr &binaryExpr [[maybe_unused]]) override {
+    // とりあえず空にしておく
+  }
+```
+
+```cpp:src/main.cpp
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinDialect.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/Verifier.h"
+#include <iostream>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/raw_ostream.h>
+#include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Pass/Pass.h>
+#include <mlir/Pass/PassManager.h>
+#include <mlir/Pass/PassRegistry.h>
+#include <mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h>
+#include <mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h>
+#include <mlir/Target/LLVMIR/Export.h>
+
+#include "ast.h"
+#include "lexer.h"
+#include "mlirGen.h"
+#include "parser.h"
+
+#include "ir/NyaZyDialect.h"
+#include "ir/NyaZyOps.h"
+#include "ir/Pass.h"
+
+int main() {
+  std::string src = R"(
+2+4*(2+1)
+)";
+  llvm::outs() << "Source code:\n";
+  llvm::outs() << src;
+  nyacc::Lexer lexer(src);
+  llvm::outs() << "Tokens:\n";
+  const auto tokens = lexer.tokenize();
+  for (const auto &token : tokens) {
+    std::cout << token << "\n";
+  }
+  nyacc::Parser parser{tokens};
+  auto moduleAst = parser.parseModule();
+  llvm::outs() << "AST:\n";
+  moduleAst.dump();
+
+  return 0;
+}
+```
+実行してみます。
+```bash
+$ ./bin build
+$ ./bin nyacc
+Source code:
+
+2+4*(2+1)
+Tokens:
+Token(NumLit, 2)
+Token(Plus, +)
+Token(NumLit, 4)
+Token(Star, *)
+Token(OpenParen, ()
+Token(NumLit, 2)
+Token(Plus, +)
+Token(NumLit, 1)
+Token(CloseParen, ))
+Token(Eof, )
+AST:
+ModuleAST
+  BinaryExpr(
+    NumLitExpr(2)
+    +
+    BinaryExpr(
+      NumLitExpr(4)
+      *
+      BinaryExpr(
+        NumLitExpr(2)
+        +
+        NumLitExpr(1)
+      )
+    )
+  )
+```
+`+`と、`*`の優先順位、`()`の解釈も問題なくできているようです。
