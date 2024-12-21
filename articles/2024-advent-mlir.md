@@ -2827,3 +2827,261 @@ ModuleAST
   )
 ```
 `+`と、`*`の優先順位、`()`の解釈も問題なくできているようです。
+#### MLIRGen: 四則演算それぞれの命令をNyaZyに足す
+四則演算は、ASTまで対応したので、MLIRに変換する部分を実装していきます。これは、２つの手順からなります。
+1. NyaZy Dialectに、`AddOp`、`SubOp`、`MulOp`、`DivOp`を追加する。
+2. 新しいASTノードである`BinaryExpr`からMLIRへの変換部分を実装する。
+
+まずは、`include/ir/NyaZyOps.td`を編集して、四則演算に対応する命令を足していきます。とりあえず64ビット整数のみを対象にするため、`I64`を`arguments`と`results`の型にしています。`[Pure]`でtraitを指定し、純粋な演算であることも示しておきます。これらは後々`arith.add`などにLoweringする予定なので、なるべくそれを参考に作ったほうが良いのですが、よく分からない項目も多いので一旦シンプルに定義しています。
+```td:include/ir/NyaZyOps.td
+#ifndef NYAZY_OPS
+#define NYAZY_OPS
+
+include "NyaZyDialect.td"
+include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/IR/OpAsmInterface.td"
+include "mlir/Interfaces/InferIntRangeInterface.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/IR/BuiltinAttributeInterfaces.td"
+include "mlir/Interfaces/CallInterfaces.td"
+include "mlir/Interfaces/FunctionInterfaces.td"
+include "mlir/IR/SymbolInterfaces.td"
+
+// 中略
+
+//===----------------------------------------------------------------------===//
+// AddOp
+// reference: thirdparty/build/llvm/src/llvm_project/mlir/examples/toy/Ch7/include/toy/Ops.td
+//===----------------------------------------------------------------------===//
+def AddOp : NyaZyOp<"add",
+    [Pure]> {
+  let summary = "addition operation";
+  let description = [{
+    The "nyazy.add" operation represents the addition of two values.
+  }];
+
+  let arguments = (ins I64:$lhs, I64:$rhs);
+  let results = (outs I64);
+
+  // Allow building an AddOp with from the two input operands.
+}
+
+//===----------------------------------------------------------------------===//
+// SubOp
+//===----------------------------------------------------------------------===//
+def SubOp : NyaZyOp<"sub",
+    [Pure]> {
+  let summary = "subtraction operation";
+  let description = [{
+    The "nyazy.sub" operation represents the subtraction of two values.
+  }];
+
+  let arguments = (ins I64:$lhs, I64:$rhs);
+  let results = (outs I64);
+}
+
+//===----------------------------------------------------------------------===//
+// MulOp
+//===----------------------------------------------------------------------===//
+def MulOp : NyaZyOp<"mul",
+    [Pure]> {
+  let summary = "multiplication operation";
+  let description = [{
+    The "nyazy.mul" operation represents the multiplication of two values.
+  }];
+
+  let arguments = (ins I64:$lhs, I64:$rhs);
+  let results = (outs I64);
+}
+
+//===----------------------------------------------------------------------===//
+// DivOp
+//===----------------------------------------------------------------------===//
+def DivOp : NyaZyOp<"div",
+    [Pure]> {
+  let summary = "divide operation";
+  let description = [{
+    The "nyazy.div" operation represents the divide of two values.
+  }];
+
+  let arguments = (ins I64:$lhs, I64:$rhs);
+  let results = (outs I64);
+}
+
+// 中略
+
+#endif // NYAZY_OPS
+```
+次に、`src/mlirGen.cpp`を編集して、`BinaryExpr`をMLIRに変換する処理を追加していきます。`class BinaryExpr`では、左辺と右辺は`getLhs`、`getRhs`で取得しているようにしているので、`accept`を順番に呼んで、それぞれの式をMLIRに変換します。`Expr`に対して`visit`、すなわち`accept`を呼んだときは、`MLIRGenVisitor`の`std::optional<mlir::Value> value_`にその対応するMLIRの命令を格納することにしていたのでした。`accept`した後に、`value_.value()`でその中身を取り出します。`lhs`と`rhs`という変数にそれぞれ`mlir::Value`を入れています。
+その後、`getOp`で二項演算子の種類によって、`AddOp`や`SubOp`など適切なNyaZy Dialectの命令を組み立てて、`value_`に入れます。`BinaryExpr`に対する`visit`も、`Expr`に対する`visit`なので、その対応する命令を`value_`に格納しています。このように設計することで、例えば「`BinaryExpr`の`rhs`もまた`BinaryExpr`である」、といった場合も再帰的に処理されることによってMLIRを適切に生成できます。
+```cpp:src/mlirGen.cpp
+#include "mlirGen.h"
+#include "ast.h"
+#include "ir/NyaZyDialect.h"
+#include "ir/NyaZyOps.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include <iostream>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
+
+namespace {
+
+// 中略
+class MLIRGenVisitor : public nyacc::Visitor {
+public:
+  // 中略
+  void visit(const nyacc::BinaryExpr &binaryExpr) override {
+    binaryExpr.getLhs()->accept(*this);
+    auto lhs = value_.value();
+    binaryExpr.getRhs()->accept(*this);
+    auto rhs = value_.value();
+
+    switch (binaryExpr.getOp()) {
+    case nyacc::BinaryOp::Add: {
+      value_ =
+          builder_.create<nyacc::AddOp>(builder_.getUnknownLoc(), lhs, rhs);
+      break;
+    }
+    case nyacc::BinaryOp::Sub: {
+      value_ =
+          builder_.create<nyacc::SubOp>(builder_.getUnknownLoc(), lhs, rhs);
+      break;
+    }
+    case nyacc::BinaryOp::Mul: {
+      value_ =
+          builder_.create<nyacc::MulOp>(builder_.getUnknownLoc(), lhs, rhs);
+      break;
+    }
+    case nyacc::BinaryOp::Div: {
+      value_ =
+          builder_.create<nyacc::DivOp>(builder_.getUnknownLoc(), lhs, rhs);
+      break;
+    }
+    }
+  }
+  // 中略
+}
+}
+  // 中略
+```
+
+それでは、`src/main.cpp`を編集して、変換されるMLIRを確認してみましょう。
+```cpp:src/main.cpp
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinDialect.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/Verifier.h"
+#include <iostream>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/raw_ostream.h>
+#include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Pass/Pass.h>
+#include <mlir/Pass/PassManager.h>
+#include <mlir/Pass/PassRegistry.h>
+#include <mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h>
+#include <mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h>
+#include <mlir/Target/LLVMIR/Export.h>
+
+#include "ast.h"
+#include "lexer.h"
+#include "mlirGen.h"
+#include "parser.h"
+
+#include "ir/NyaZyDialect.h"
+#include "ir/NyaZyOps.h"
+#include "ir/Pass.h"
+
+int main() {
+  std::string src = R"(
+2+4*(2+1)
+)";
+  llvm::outs() << "Source code:\n";
+  llvm::outs() << src;
+  nyacc::Lexer lexer(src);
+  llvm::outs() << "Tokens:\n";
+  const auto tokens = lexer.tokenize();
+  for (const auto &token : tokens) {
+    std::cout << token << "\n";
+  }
+  nyacc::Parser parser{tokens};
+  auto moduleAst = parser.parseModule();
+  llvm::outs() << "AST:\n";
+  moduleAst.dump();
+
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<nyacc::NyaZyDialect>();
+  context.getOrLoadDialect<mlir::arith::ArithDialect>();
+  context.getOrLoadDialect<mlir::LLVM::LLVMDialect>();
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  auto module = nyacc::MLIRGen::gen(context, moduleAst);
+  llvm::outs() << "MLIR:\n";
+  module->dump();
+
+  if (mlir::failed(mlir::verify(*module))) {
+    llvm::errs() << "Module verification failed.\n";
+    return 1;
+  }
+
+  return 0;
+}
+
+```
+実行してみます。
+```
+$ ./bin build
+$ ./bin nyacc
+Source code:
+
+2+4*(2+1)
+Tokens:
+Token(NumLit, 2)
+Token(Plus, +)
+Token(NumLit, 4)
+Token(Star, *)
+Token(OpenParen, ()
+Token(NumLit, 2)
+Token(Plus, +)
+Token(NumLit, 1)
+Token(CloseParen, ))
+Token(Eof, )
+AST:
+ModuleAST
+  BinaryExpr(
+    NumLitExpr(2)
+    +
+    BinaryExpr(
+      NumLitExpr(4)
+      *
+      BinaryExpr(
+        NumLitExpr(2)
+        +
+        NumLitExpr(1)
+      )
+    )
+  )
+MLIR:
+module {
+  nyazy.func @main() {
+    %0 = nyazy.constant 2 : i64
+    %1 = nyazy.constant 4 : i64
+    %2 = nyazy.constant 2 : i64
+    %3 = nyazy.constant 1 : i64
+    %4 = "nyazy.add"(%2, %3) : (i64, i64) -> i64
+    %5 = "nyazy.mul"(%1, %4) : (i64, i64) -> i64
+    %6 = "nyazy.add"(%0, %5) : (i64, i64) -> i64
+    "nyazy.return"(%6) : (i64) -> ()
+  }
+}
+```
+`nyazy.add`や`nyazy.mul`などに適切に変換されていることが分かります！
+
+#### lowerToLLVM: 追加したNyaZy Dialectの命令をLLVM Dialectに変換する
+WIP
