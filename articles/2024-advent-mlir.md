@@ -3084,4 +3084,279 @@ module {
 `nyazy.add`や`nyazy.mul`などに適切に変換されていることが分かります！
 
 #### lowerToLLVM: 追加したNyaZy Dialectの命令をLLVM Dialectに変換する
-WIP
+このStep3で追加したNyaZy Dialectの命令は、`nyazy.{add,sub,mul,div}`、の４つです。これらは、[Arith Dialect](https://mlir.llvm.org/docs/Dialects/ArithOps/)の`arith.{addi,subi,muli,divi}`にそれぞれ変換することとします。現時点では、すべて整数を扱っているので`i`がつきます。すべての二項演算で似たような`mlir::OpConversionPattern`を作ってしまうことになるので、ここでは、templateを使用します。
+
+前に実装した`ConstantOpLowering`などを参考に作っていきます。`matchAndRewrite`の第一引数がマッチしたOpの型になるので、ここをテンプレート引数の型 `BinaryOp` になるようにします。また継承するクラスも、`mlir::OpConversionPattern<BinaryOp>`になります。変換後のArith Dialectの命令の型は、`LoweredBinaryOp`としていて、`rewriter.create<LoweredBinaryOp>`として渡しています。コンストラクタはすべて、`Location`, `Lhs`, `Rhs`の順番に渡せば良いようです。（`mlir::arith::AddOp`などに定義ジャンプして、`build`メソッドの引数の型を見ることでわかります。）
+
+毎回 `BinaryOpLowering<nyacc::AddOp, mlir::arith::AddIOp>`に書いて使ってもいいのですが、面倒くさいので、`using`を使って別名をつけています。これで、`{Add,Sub,Mul,Div}OpLowering`ができました！
+`NyaZyToLLVMPass::runOnOperation`の`patterns.add`のテンプレート引数にこれらのクラスを渡してあげることで、このパスでこれらのConversionPatternが適用されることになります。
+これらが適用されることで、NyaZy Dialectのすべての命令は再びArith DialectかFunc Dialectへ変換されることとなり、それらは、MLIR標準で提供される変換によりLLVM Dialectまで変換されることとなります。
+```cpp:src/ir/lowerToLLVM.cpp
+#include "ir/NyaZyDialect.h"
+#include "ir/NyaZyOps.h"
+#include "ir/Pass.h"
+#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinDialect.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/DialectConversion.h"
+#include <iostream>
+#include <llvm/Support/raw_ostream.h>
+#include <mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h>
+#include <mlir/Dialect/LLVMIR/LLVMDialect.h>
+#include <mlir/Dialect/LLVMIR/LLVMTypes.h>
+#include <mlir/IR/Builders.h>
+#include <mlir/IR/BuiltinAttributes.h>
+#include <mlir/IR/Operation.h>
+#include <mlir/IR/PatternMatch.h>
+#include <mlir/Support/LLVM.h>
+#include <mlir/Support/TypeID.h>
+
+namespace {
+
+class ConstantOpLowering : public mlir::OpConversionPattern<nyacc::ConstantOp> {
+public:
+  explicit ConstantOpLowering(mlir::MLIRContext *context)
+      : OpConversionPattern(context) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(nyacc::ConstantOp op, OpAdaptor adaptor [[maybe_unused]],
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto constantOp = mlir::cast<nyacc::ConstantOp>(op);
+    rewriter.replaceOp(op, rewriter.create<mlir::arith::ConstantOp>(
+                               op->getLoc(), constantOp.getValue()));
+
+    return mlir::success();
+  }
+};
+
+template <typename BinaryOp, typename LoweredBinaryOp>
+struct BinaryOpLowering : public mlir::OpConversionPattern<BinaryOp> {
+  BinaryOpLowering(mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<BinaryOp>(ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(BinaryOp op, BinaryOp::Adaptor adaptor [[maybe_unused]],
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto binOp = mlir::cast<BinaryOp>(op);
+    rewriter.replaceOp(op, rewriter.create<LoweredBinaryOp>(
+                               op->getLoc(), binOp.getLhs(), binOp.getRhs()));
+
+    return mlir::success();
+  }
+};
+using AddOpLowering = BinaryOpLowering<nyacc::AddOp, mlir::arith::AddIOp>;
+using SubOpLowering = BinaryOpLowering<nyacc::SubOp, mlir::arith::SubIOp>;
+using MulOpLowering = BinaryOpLowering<nyacc::MulOp, mlir::arith::MulIOp>;
+using DivOpLowering = BinaryOpLowering<nyacc::DivOp, mlir::arith::DivSIOp>;
+
+// 中略
+
+} // namespace
+
+void NyaZyToLLVMPass::runOnOperation() {
+  mlir::ConversionTarget target(getContext());
+  target.addLegalDialect<mlir::BuiltinDialect, mlir::LLVM::LLVMDialect>();
+  target.addIllegalDialect<nyacc::NyaZyDialect>();
+
+  mlir::RewritePatternSet patterns(&getContext());
+  // nyazy -> arith + func
+  patterns.add<ConstantOpLowering, FuncOpLowering, ReturnOpLowering,
+               AddOpLowering, SubOpLowering, MulOpLowering, DivOpLowering>(
+      &getContext());
+
+  // * -> llvm
+  mlir::LLVMTypeConverter typeConverter(&getContext());
+  mlir::arith::populateArithToLLVMConversionPatterns(typeConverter, patterns);
+  mlir::populateFuncToLLVMConversionPatterns(typeConverter, patterns);
+
+  if (failed(
+          applyFullConversion(getOperation(), target, std::move(patterns)))) {
+    signalPassFailure();
+  }
+}
+// 中略
+```
+それでは、`src/main.cpp`を編集して、実際に実行して試してみましょう。毎回stdoutに出たLLVM IRをコピペするのが面倒くさいので、`output.ll`に保存されるようにもしています。
+```cpp:src/main.cpp
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinDialect.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/Verifier.h"
+#include <iostream>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/raw_ostream.h>
+#include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Pass/Pass.h>
+#include <mlir/Pass/PassManager.h>
+#include <mlir/Pass/PassRegistry.h>
+#include <mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h>
+#include <mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h>
+#include <mlir/Target/LLVMIR/Export.h>
+
+#include "ast.h"
+#include "lexer.h"
+#include "mlirGen.h"
+#include "parser.h"
+
+#include "ir/NyaZyDialect.h"
+#include "ir/NyaZyOps.h"
+#include "ir/Pass.h"
+
+int main() {
+  std::string src = R"(
+2+4*(2+1)
+)";
+  llvm::outs() << "Source code:\n";
+  llvm::outs() << src;
+  nyacc::Lexer lexer(src);
+  llvm::outs() << "Tokens:\n";
+  const auto tokens = lexer.tokenize();
+  for (const auto &token : tokens) {
+    std::cout << token << "\n";
+  }
+  nyacc::Parser parser{tokens};
+  auto moduleAst = parser.parseModule();
+  llvm::outs() << "AST:\n";
+  moduleAst.dump();
+
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<nyacc::NyaZyDialect>();
+  context.getOrLoadDialect<mlir::arith::ArithDialect>();
+  context.getOrLoadDialect<mlir::LLVM::LLVMDialect>();
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  auto module = nyacc::MLIRGen::gen(context, moduleAst);
+  llvm::outs() << "MLIR:\n";
+  module->dump();
+
+  if (mlir::failed(mlir::verify(*module))) {
+    llvm::errs() << "Module verification failed.\n";
+    return 1;
+  }
+
+  mlir::PassManager pm(&context);
+  pm.addPass(nyacc::createNyaZyToLLVMPass());
+
+  if (mlir::failed(pm.run(*module))) {
+    llvm::errs() << "Failed to lower to LLVM IR\n";
+    return 1;
+  }
+
+  llvm::outs() << "Lowered MLIR:\n";
+  module->dump();
+
+  if (mlir::failed(mlir::verify(*module))) {
+    llvm::errs() << "Module verification failed.\n";
+    return 1;
+  }
+
+  // Convet the MLIR module to LLVM IR
+  mlir::registerBuiltinDialectTranslation(*module->getContext());
+  mlir::registerLLVMDialectTranslation(*module->getContext());
+  llvm::LLVMContext llvmContext;
+  auto llvmModule = mlir::translateModuleToLLVMIR(*module, llvmContext);
+
+  if (!llvmModule) {
+    llvm::errs() << "Failed to emit LLVM IR\n";
+    return 1;
+  }
+
+  // ファイルに書き出す
+  std::error_code EC;
+  llvm::raw_fd_ostream outputFile("output.ll", EC,
+                                  llvm::sys::fs::OpenFlags::OF_None);
+
+  if (EC) {
+    llvm::errs() << "Could not open file: " << EC.message() << "\n";
+    return 1;
+  }
+  llvmModule->print(outputFile, nullptr);
+
+  llvm::outs() << "Generated LLVM IR:\n";
+  llvmModule->print(llvm::outs(), nullptr);
+
+  return 0;
+}
+```
+```bash
+$ ./bin build
+$ ./bin nyacc
+Source code:
+
+2+4*(2+1)
+Tokens:
+Token(NumLit, 2)
+Token(Plus, +)
+Token(NumLit, 4)
+Token(Star, *)
+Token(OpenParen, ()
+Token(NumLit, 2)
+Token(Plus, +)
+Token(NumLit, 1)
+Token(CloseParen, ))
+AST:
+ModuleAST
+  BinaryExpr(
+    NumLitExpr(2)
+    +
+    BinaryExpr(
+      NumLitExpr(4)
+      *
+      BinaryExpr(
+        NumLitExpr(2)
+        +
+        NumLitExpr(1)
+      )
+    )
+  )
+MLIR:
+module {
+  nyazy.func @main() {
+    %0 = nyazy.constant 2 : i64
+    %1 = nyazy.constant 4 : i64
+    %2 = nyazy.constant 2 : i64
+    %3 = nyazy.constant 1 : i64
+    %4 = "nyazy.add"(%2, %3) : (i64, i64) -> i64
+    %5 = "nyazy.mul"(%1, %4) : (i64, i64) -> i64
+    %6 = "nyazy.add"(%0, %5) : (i64, i64) -> i64
+    "nyazy.return"(%6) : (i64) -> ()
+  }
+}
+Lowered MLIR:
+module {
+  llvm.func @main() -> i64 {
+    %0 = llvm.mlir.constant(2 : i64) : i64
+    %1 = llvm.mlir.constant(4 : i64) : i64
+    %2 = llvm.mlir.constant(2 : i64) : i64
+    %3 = llvm.mlir.constant(1 : i64) : i64
+    %4 = llvm.add %2, %3 : i64
+    %5 = llvm.mul %1, %4 : i64
+    %6 = llvm.add %0, %5 : i64
+    llvm.return %6 : i64
+  }
+}
+Generated LLVM IR:
+; ModuleID = 'LLVMDialectModule'
+source_filename = "LLVMDialectModule"
+
+define i64 @main() {
+  ret i64 14
+}
+$ ./bin lli output.ll
+# bashの場合
+$ echo $?
+14
+# fishの場合
+$ echo $status
+14
+```
+`2+4*(2+1)`が実行されて、`14`になっています。NyaZy Dialectで記述されたMLIRが、LLVM Dialectまで変換されている様子も`Lowered MLIR:`の部分を見ることでわかります。`Generated LLVM IR:`を見ると、LLVM IRに変換する段階で、最適化が働いて、事前に計算されて`14`になっているようです。ともかく、記述された四則演算を実行して、exit codeとして出力できるようになりました！
