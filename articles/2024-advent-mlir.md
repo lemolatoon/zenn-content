@@ -3729,3 +3729,439 @@ $ ./bin test
 100% tests passed, 0 tests failed out of 1
 ...
 ```
+
+### Step5 エラーメッセージを改善する
+これまでは、パースなどに失敗した場合、`std::abort`を呼んで強制的にプログラムを終了させていました。しかし、現実のコンパイラ、たとえば`gcc`などはコンパイルに失敗すると実際にどの部分が原因でコンパイル二失敗したのかを教えてくれます。
+C++で異常を知らせる手段として例外がありますが、ここでは`std::expected<T, E>`という、成功または失敗を表す型を用いてエラーハンドリングをします。`std::expected`はC++23からの使えるものなので、代わりに[tl/expected](https://github.com/TartanLlama/expected)を使うことにします。
+
+#### tl-expectedの導入
+
+`tl-expected`のために、`thirdparty/CMakeLists.txt`を編集します。`thirdparty/build/tl-expected/install`にinstallされるようにします。
+```cmake:thirdparty/CMakeLists.txt
+cmake_minimum_required(VERSION 3.15)
+project(nyazy-thirdparty)
+
+include(ExternalProject)
+
+# Set the directory where installed
+set(LLVM_PROJECT_INSTALL_DIR ${CMAKE_BINARY_DIR}/llvm/install)
+set(TL_EXPECTED_INSTALL_DIR ${CMAKE_BINARY_DIR}/tl-expected/install)
+
+
+# Specify the LLVM version and Git tag
+set(LLVM_VERSION "llvmorg-19.1.2")
+set(LLVM_REPO_URL "https://github.com/llvm/llvm-project.git")
+set(LLVM_PROJECT_BUILD_DIR ${CMAKE_BINARY_DIR}/llvm-project/build)
+
+# https://stackoverflow.com/questions/45414507/pass-a-list-of-prefix-paths-to-externalproject-add-in-cmake-args
+string(REPLACE ";" "|" CMAKE_PREFIX_PATH_ALT_SEP "${CMAKE_PREFIX_PATH}")
+
+# Add LLVM as an external project
+ExternalProject_Add(
+    llvm_project
+    PREFIX ${CMAKE_BINARY_DIR}/llvm
+    GIT_REPOSITORY ${LLVM_REPO_URL}
+    GIT_TAG ${LLVM_VERSION}
+    SOURCE_SUBDIR llvm
+    UPDATE_COMMAND ""
+    LIST_SEPARATOR |
+    CMAKE_ARGS
+        -DLLVM_ENABLE_PROJECTS=clang|mlir
+        -DLLVM_ENABLE_RUNTIMES=libcxx|libcxxabi|libunwind
+        -DLLVM_BUILD_EXAMPLES=ON
+        -DLLVM_BUILD_TOOLS=ON
+        -DLLVM_TARGETS_TO_BUILD=Native
+        -DCMAKE_BUILD_TYPE=Release
+        -DLLVM_ENABLE_ASSERTIONS=ON
+        -DCMAKE_C_COMPILER=clang
+        -DCMAKE_CXX_COMPILER=clang++
+        -DLLVM_ENABLE_LLD=ON
+        -DLLVM_CCACHE_BUILD=ON
+        -DCMAKE_INSTALL_PREFIX=${LLVM_PROJECT_INSTALL_DIR}
+        -DLLVM_TOOL_CLANG_BUILD=ON
+    BUILD_COMMAND ${CMAKE_COMMAND} --build .
+    INSTALL_COMMAND ${CMAKE_COMMAND} --build . --target install
+    USES_TERMINAL_BUILD TRUE
+)
+
+
+ExternalProject_Add(
+  tl-expected
+  GIT_REPOSITORY https://github.com/TartanLlama/expected.git
+  GIT_TAG        master
+  PREFIX         ${CMAKE_BINARY_DIR}/tl-expected
+  #  CONFIGURE_COMMAND ""
+  #  BUILD_COMMAND ""
+  #  INSTALL_COMMAND ""
+  CMAKE_ARGS
+  -DCMAKE_INSTALL_PREFIX=${TL_EXPECTED_INSTALL_DIR}
+  BUILD_COMMAND ${CMAKE_COMMAND} --build .
+  INSTALL_COMMAND ${CMAKE_COMMAND} --build . --target install
+  LOG_DOWNLOAD ON
+)
+
+```
+`CMakeLists.txt`で`tl-expected`を使用するための設定を追加します。
+```cmake:CMakeLists.txt
+# 略
+set(tl-expected_INSTALL_DIR ${CMAKE_BINARY_DIR}/../thirdparty/build/tl-expected/install)
+set(tl-expected_DIR ${tl-expected_INSTALL_DIR}/share/cmake/tl-expected)
+
+find_package(tl-expected REQUIRED CONFIG)
+include_directories(${tl-expected_INSTALL_DIR}/include)
+# 略
+```
+
+#### LexerにLocation情報をもたせエラーハンドリングする
+[該当コミット](https://github.com/lemolatoon/NyaZy/pull/4/commits/47675ce0ebc4b40304080ae97b09edb968bf4f48) [差分プルリクエスト](https://github.com/lemolatoon/NyaZy/pull/4)
+```bash
+$ git checkout 47675ce0ebc4b40304080ae97b09edb968bf4f48
+# ↓この記事のために整形したもの
+$ git checkout 3acb09fc587e1601f2871f886ebaa72af8db28d8
+```
+このプリリクエストでは、`tl::expected`ではなく、`std::expected`を使っているので注意です。masterブランチでは、`tl::expected`になっています。
+
+エラーを親切に表示するためには、そのエラーがソースコードのうちどこに該当するのかというLocation情報が重要です。`Lexer::tokenize`のときに、`Token`に何行目、何列目というLocation情報をもたせることで、その`Token`でエラーになったときに、適切なエラーメッセージを表示できるようにします。
+
+まずは、`include/error.h`を追加し、`struct Location`と、`struct ErrorInfo`を追加します。
+```cpp:include/error.h
+#pragma once
+#include <iostream>
+#include <memory>
+#include <string>
+
+namespace nyacc {
+
+/// Structure definition a location in a file.
+struct Location {
+  std::shared_ptr<std::string> file; ///< filename.
+  int line;                          ///< line number.
+  int col;                           ///< column number.
+};
+
+struct ErrorInfo {
+  std::string message;
+  nyacc::Location location;
+
+  std::string error(std::string_view src) const;
+};
+} // namespace nyacc
+
+```
+
+`struct Location`は、ファイル名と行、列の情報を持っています。`ErrorInfo`は`Location`に加えて、エラーメッセージを持ちます。また、`error`という関数があり、ソースコードの文字列を渡すことで、エラーメッセージを整形して返します。`ErrorInfo::error`を実装します。
+```cpp:src/error.cpp
+#include "error.h"
+#include <ostream>
+#include <sstream>
+
+namespace nyacc {
+std::string ErrorInfo::error(std::string_view src) const {
+  Location location = this->location;
+  location.line++;
+  location.col++;
+  auto filename = location.file ? *location.file : "<unknown>";
+  // Extract the specific line from the source code
+  std::ostringstream oss;
+  oss << filename << ":" << location.line << ":" << location.col
+      << ": error: " << message << "\n";
+  std::string error_header = oss.str();
+  std::string_view line_str;
+  {
+    int current_line = 1;
+    size_t pos = 0;
+    while (pos < src.size()) {
+      size_t next_pos = src.find('\n', pos);
+      if (next_pos == std::string_view::npos) {
+        next_pos = src.size();
+      }
+      if (current_line == location.line) {
+        line_str = src.substr(pos, next_pos - pos);
+        break;
+      }
+      pos = next_pos + 1;
+      current_line++;
+    }
+  }
+
+  std::string error_msg = error_header;
+
+  // line_str をエラーメッセージに追加
+  error_msg += std::string{line_str} + "\n";
+
+  // カラム位置に合わせてインジケータ行を作成
+  int num_spaces = location.col - 1;
+  std::string indicator(num_spaces, ' ');
+  indicator += '^';
+
+  // インジケータ行をエラーメッセージに追加
+  error_msg += indicator + "\n";
+
+  return error_msg;
+};
+} // namespace nyacc
+
+```
+次に、`include/lexer.h`を編集して、`class Token`に`Location`をもたせ、`Lexer::tokenize`は`tl::expected<std::vector<Token>, ErrorInfo>`を返すようにします。また、`tokenize`で`Location`をトラックするにあたって使う便利関数である`advanceN`や`nextLine`も追加します。`Lexer`内部には、`Location currentLocation_`を持たせます。これは、次のトークンの位置を示すようにします。ただ、これを直接変更するのではなく、`advanceN`や`nextLine`を通じて変更することで、間違えなく`currentLocation_`と`pos_`を連動して変更するようにします。`class Token`のコンストラクタは新たに`struct Location`を要求するようになっています。
+```cpp:include/lexer.h
+#pragma once
+
+#include "error.h"
+#include <cassert>
+#include <tl/expected.hpp>
+#include <memory>
+#include <string_view>
+#include <vector>
+
+namespace nyacc {
+
+class Token {
+public:
+  enum class TokenKind {
+    NumLit,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    OpenParen,
+    CloseParen,
+    Eof,
+  };
+  static const char *tokenKindToString(TokenKind kind) {
+    switch (kind) {
+    case TokenKind::NumLit:
+      return "NumLit";
+    case TokenKind::Plus:
+      return "Plus";
+    case TokenKind::Minus:
+      return "Minus";
+    case TokenKind::Star:
+      return "Star";
+    case TokenKind::Slash:
+      return "Slash";
+    case TokenKind::OpenParen:
+      return "OpenParen";
+    case TokenKind::CloseParen:
+      return "CloseParen";
+    case TokenKind::Eof:
+      return "Eof";
+    }
+  }
+  Token(TokenKind kind, std::string_view text, Location loc)
+      : kind_(kind), text_(text), loc_(loc) {}
+  TokenKind getKind() const { return kind_; }
+  std::string_view text() const { return text_; }
+
+  friend std::ostream &operator<<(std::ostream &os, const Token &token);
+
+private:
+  TokenKind kind_;
+  std::string_view text_;
+  Location loc_;
+};
+
+class Lexer {
+public:
+  Lexer(std::string_view input)
+      : Lexer(input, std::make_shared<std::string>("unkown-file")) {}
+  Lexer(std::string_view input, std::shared_ptr<std::string> filename)
+      : input_(input), pos_(0),
+        currentLocation_(Location{.file = filename, .line = 0, .col = 0}) {}
+
+  tl::expected<std::vector<Token>, ErrorInfo> tokenize();
+  const Location &currentLocation() const { return currentLocation_; }
+
+private:
+  std::string_view head();
+
+  void advanceN(size_t n);
+
+  void advance();
+
+  bool atEof() const;
+
+  void nextLine();
+
+  std::string_view input_;
+  size_t pos_;
+
+  Location currentLocation_{};
+};
+} // namespace nyacc
+
+```
+`src/lexer.cpp`には、いよいよエラーハンドリング付きの`Lexer::tokenize`を実装します。いくつか`tokenize`を書く上での便利関数を追加しています。また、予約トークンは、for文でまとめて処理するようにしています。次の文字を見たいときには、`advance()`を呼び、次の行を見たいときには、`nextLine()`を呼びます。こうすることで、内部のソースコードのカーソルの`pos_`とLocation情報である`currentLocation_`との整合性を取れるようにしています。`Token`を作るたびに、`currentLocation`で、トークンの位置を取得しています。
+また、どの予約トークンにも該当しなかった場合は、エラーなので、`ErrorInfo`を作成して、`tl::unexpected`でエラーとして返しています。このあたりは、[std::expected](https://cpprefjp.github.io/reference/expected/expected.html)と使い方は同じです。
+```cpp:src/lexer.cpp
+#include "lexer.h"
+#include <cctype>
+#include <error.h>
+#include <tl/expected.hpp>
+#include <iostream>
+#include <sstream>
+#include <string>
+
+namespace nyacc {
+
+std::ostream &operator<<(std::ostream &os, const Token &token) {
+  os << "Token(" << Token::tokenKindToString(token.kind_) << ", " << token.text_
+     << ")";
+  return os;
+}
+
+std::string_view Lexer::head() { return input_.substr(pos_); }
+void Lexer::advanceN(size_t n) {
+  pos_ += n;
+  currentLocation_.col += n;
+}
+void Lexer::advance() { advanceN(1); }
+bool Lexer::atEof() const { return pos_ >= input_.size(); }
+void Lexer::nextLine() {
+  assert(input_[pos_] == '\n' &&
+         "nextLine() must be called at the beginning of a line");
+  pos_++;
+  currentLocation_.line++;
+  currentLocation_.col = 0;
+}
+tl::expected<std::vector<Token>, ErrorInfo> Lexer::tokenize() {
+  std::vector<Token> tokens;
+
+  while (!atEof()) {
+    // tokenize integer
+    if (!atEof() && std::isdigit(input_[pos_])) {
+      const auto start_pos = pos_;
+      auto loc = currentLocation();
+      while (!atEof() && std::isdigit(input_[pos_])) {
+        if (start_pos == pos_ && input_[pos_] == '0') {
+          advance();
+          break;
+        }
+        advance();
+      }
+      std::string_view num_lit = input_.substr(start_pos, pos_ - start_pos);
+      tokens.emplace_back(Token::TokenKind::NumLit, num_lit, loc);
+      continue;
+    }
+
+    if (input_[pos_] == ' ') {
+      advance();
+      continue;
+    }
+
+    if (input_[pos_] == '\n') {
+      nextLine();
+      continue;
+    }
+
+    const auto token_mapping = {
+        std::pair<char, Token::TokenKind>{'+', Token::TokenKind::Plus},
+        {'-', Token::TokenKind::Minus},
+        {'*', Token::TokenKind::Star},
+        {'/', Token::TokenKind::Slash},
+        {'(', Token::TokenKind::OpenParen},
+        {')', Token::TokenKind::CloseParen},
+    };
+
+    bool shouldContinue = false;
+    for (const auto &[c, kind] : token_mapping) {
+      if (input_[pos_] == c) {
+        tokens.emplace_back(kind, input_.substr(pos_, 1), currentLocation());
+        advance();
+        shouldContinue = true;
+        break;
+      }
+    }
+    if (shouldContinue) {
+      continue;
+    }
+
+    std::string error_msg;
+    std::ostringstream oss;
+    oss << "Unexpected character: " << input_[pos_];
+    error_msg = oss.str();
+    ErrorInfo info{.message = error_msg, .location = currentLocation()};
+    return tl::unexpected{info};
+  }
+
+  tokens.emplace_back(Token::TokenKind::Eof, "", currentLocation());
+  return tokens;
+}
+
+} // namespace nyacc
+```
+それでは、あえて`Lexer::tokenize`に失敗するコードを作ってみましょう。`src/main.cpp`を編集します。`tl::expected<T, E>`または、`std::expected<T, E>`は`T`または`E`の値を持っています。これはifのカッコに入れるなどして評価して`true`になれば、`T`があり、そうでなければ`E`であるというように判定できます。判定した後は、`*`を使うと`T`の値を取り出すことができ、`.error()`を呼ぶことで、`E`の値を取り出すことができます。下のコードでは、`Lexer::tokenize`の結果をエラーチェックして、エラーの場合は取り出して`ErrorInfo::error`を呼び出すようにしています。
+```cpp:src/main.cpp
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinDialect.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/Verifier.h"
+#include <iostream>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/raw_ostream.h>
+#include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/ExecutionEngine/ExecutionEngine.h>
+#include <mlir/ExecutionEngine/OptUtils.h>
+#include <mlir/Pass/Pass.h>
+#include <mlir/Pass/PassManager.h>
+#include <mlir/Pass/PassRegistry.h>
+#include <mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h>
+#include <mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h>
+#include <mlir/Target/LLVMIR/Export.h>
+
+#include "ast.h"
+#include "lexer.h"
+#include "mlirGen.h"
+#include "parser.h"
+
+#include "ir/NyaZyDialect.h"
+#include "ir/NyaZyOps.h"
+#include "ir/Pass.h"
+
+int main() {
+  std::string src = R"(
+2 + 4 & (2 * 1)
+)";
+  llvm::outs() << "Source code:\n";
+  llvm::outs() << src;
+  nyacc::Lexer lexer(src);
+  llvm::outs() << "Tokens:\n";
+  const auto tokens = lexer.tokenize();
+
+  if (!tokens) {
+    std::cout << "Error: " << tokens.error().error(src) << "\n";
+    return 1;
+  };
+
+  for (const auto &token : *tokens) {
+    std::cout << token << "\n";
+  }
+
+  // 略
+
+  return 0;
+}
+
+```
+`std::string src`には、あえて`&`というエラーになるはずの文字をいれてみます。実行してみましょう。
+```
+$ ./bin build
+$ ./bin nyacc
+Source code:
+
+2 + 4 & (2 * 1)
+Tokens:
+Error: unkown-file:2:7: error: Unexpected character: &
+2 + 4 & (2 * 1)
+      ^
+
+Error: Command 'nyacc' failed with exit code 1
+```
+行、列と、`^`とともに親切なエラーが出力されました！
