@@ -2428,7 +2428,7 @@ std::vector<Token> Lexer::tokenize() {
     // tokenize integer
     if (std::isdigit(input_[pos_])) {
       const auto start_pos = pos_;
-      while (std::isdigit(input_[pos_])) {
+      while (pos_ < input_.size() && std::isdigit(input_[pos_])) {
         if (start_pos == pos_ && input_[pos_] == '0') {
           pos_++;
           break;
@@ -3138,7 +3138,7 @@ struct BinaryOpLowering : public mlir::OpConversionPattern<BinaryOp> {
       : mlir::OpConversionPattern<BinaryOp>(ctx) {}
 
   mlir::LogicalResult
-  matchAndRewrite(BinaryOp op, BinaryOp::Adaptor adaptor [[maybe_unused]],
+  matchAndRewrite(BinaryOp op, typename BinaryOp::Adaptor adaptor [[maybe_unused]],
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto binOp = mlir::cast<BinaryOp>(op);
     rewriter.replaceOp(op, rewriter.create<LoweredBinaryOp>(
@@ -3359,4 +3359,373 @@ $ echo $?
 $ echo $status
 14
 ```
-`2+4*(2+1)`が実行されて、`14`になっています。NyaZy Dialectで記述されたMLIRが、LLVM Dialectまで変換されている様子も`Lowered MLIR:`の部分を見ることでわかります。`Generated LLVM IR:`を見ると、LLVM IRに変換する段階で、最適化が働いて、事前に計算されて`14`になっているようです。ともかく、記述された四則演算を実行して、exit codeとして出力できるようになりました！
+`2+4*(2+1)`が実行されて、`14`になっています。NyaZy Dialectで記述されたMLIRが、LLVM Dialectまで変換されている様子も`Lowered MLIR:`の部分を見ることでわかります。`Generated LLVM IR:`を見ると、LLVM IRに変換する段階で、最適化が働いて、事前に計算されて`14`になっているようです。ともかく、記述された四則演算を実行して、exit codeとして出力できるようになりました！`src/main.cpp`のソースコードの文字列を変更していろいろ試してみてください。
+
+### Step4 テストを追加する
+[該当コミット](e7815ce06fcb8422f1beedda310079d39703d962) [差分プルリクエスト](https://github.com/lemolatoon/NyaZy/pull/3)
+```bash
+$ git checkout e7815ce06fcb8422f1beedda310079d39703d962
+```
+ソフトウェアを開発する上でテストは重要です。機能を追加するたびに、その機能に関するテストを追加することで、その機能が正しく実装できたかを確かめることができます。さらに、他に機能を追加したときに、誤って機能を壊してしまったときにも、いち早く気づくことができます。機能を壊してしまったときに早く気づくことは重要です。壊れる前と壊れた後のコードの差分が少なければ、デバッグする範囲も少なく済みます。
+
+#### GoogleTestのセットアップ
+C++にはたくさんのテストフレームワークがあるようですが、ここでは[GoogleTest](https://github.com/google/googletest)を使います。GoogleTestを使うための設定に、まずはCMakeの設定をします。`CMakeLists.txt`と`src/CMakeLists.txt`を編集し、`test/CMakeLists.txt`も作成します。
+`CMakeLists.txt`と`src/CMakeLists.txt`を編集することにより、`src/main.cpp`と、それ以外を別のライブラリにしています。こうすることで、`main`関数以外の部分をテストコードにリンクして使うことができるようになります。`src/main.cpp`を含め内容にするのは、テスト側では別のmain関数を用意するためです。まず`src/main.cpp`以外のファイルを`libNYACC`という名前のライブラリでコンパイルさせるようにします。`src/main.cpp`には、`libNYACC`をリンクします。また、テストの実行ファイルは`simpleTest`という名前にすることにします。`add_executable`で追加することを宣言します。
+GoogleTestを使う設定は、[GoogleTestのREADME](https://github.com/google/googletest/blob/main/googletest/README.md#incorporating-into-an-existing-cmake-project)を参考に記述します。
+```cmake:CMakeLists.txt
+cmake_minimum_required(VERSION 3.15)
+project(nyazy LANGUAGES CXX C)
+
+set(CMAKE_CXX_STANDARD 20)
+
+include(ExternalProject)
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+set(LLVM_DIR ${CMAKE_BINARY_DIR}/../thirdparty/build/llvm/install/lib/cmake/llvm)
+set(MLIR_DIR ${CMAKE_BINARY_DIR}/../thirdparty/build/llvm/install/lib/cmake/mlir)
+
+find_package(LLVM REQUIRED CONFIG)
+find_package(MLIR REQUIRED CONFIG)
+
+# mlir related settings -----
+# ref: llvm-project/mlir/examples/standalone/CMakeLists.txt
+list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
+list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+
+# include scripts
+include(TableGen)
+include(AddLLVM)
+include(AddMLIR)
+include(HandleLLVMOptions)
+
+include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
+include_directories(SYSTEM ${MLIR_INCLUDE_DIRS})
+
+link_directories(${LLVM_BUILD_LIBRARY_DIR})
+# ---------------------------
+
+# nyacc, simpleTestは実行ファイル。libNYACC、NyaZyDialectはライブラリ。
+add_executable(nyacc)
+add_library(libNYACC)
+add_library(NyaZyDialect)
+add_executable(simpleTest)
+target_compile_options(nyacc PRIVATE -Wall -Wextra -Werror -fno-rtti)
+target_compile_options(libNYACC PRIVATE -Wall -Wextra -Werror -fno-rtti)
+target_compile_options(simpleTest PRIVATE -Wall -Wextra -Werror -fno-rtti)
+target_compile_options(NyaZyDialect PRIVATE -Wall -Wextra -Werror -fno-rtti)
+
+
+include_directories(include)
+add_subdirectory(include)
+include_directories(${CMAKE_BINARY_DIR}/include)
+
+# .tdファイルの依存の記述はそれぞれに対して書いておく
+add_dependencies(libNYACC MLIRNyaZyDialectIncGen)
+add_dependencies(libNYACC MLIRNyaZyDialectIncGen)
+
+add_dependencies(nyacc MLIRNyaZyOpsIncGen)
+add_dependencies(nyacc MLIRNyaZyDialectIncGen)
+
+add_dependencies(simpleTest MLIRNyaZyOpsIncGen)
+add_dependencies(simpleTest MLIRNyaZyDialectIncGen)
+
+# GoogleTestのセットアップ
+include(FetchContent)
+FetchContent_Declare(
+  googletest
+  URL https://github.com/google/googletest/archive/refs/tags/release-1.12.1.zip
+)
+
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googletest)
+# GoogleTestのセットアップ 終わり
+
+add_subdirectory(src)
+# test/CMakeLists.txtを読み込む
+add_subdirectory(test)
+```
+```cmake:src/CMakeLists.txt
+add_subdirectory(ir)
+
+# Locate all the .cpp files in the src directory
+set(SRC_FILES
+    lexer.cpp
+    ast.cpp
+    parser.cpp
+    mlirGen.cpp
+)
+
+get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
+get_property(extension_libs GLOBAL PROPERTY MLIR_EXTENSION_LIBS)
+
+# libNYACCには、src/main.cpp以外のソースファイルを指定して、MLIRやLLVMのライブラリ必要なものすべてリンクする
+message(STATUS "nyazy dialect sources: ${nyazy_dialect_sources}")
+# Create an executable for the main project from the source files
+target_sources(libNYACC PRIVATE ${SRC_FILES} ${nyazy_dialect_sources})
+
+# Link with necessary libraries (e.g., LLVM, if needed)
+# target_link_libraries(nyacc ${LLVM_LIBS})
+target_link_libraries(libNYACC
+    PRIVATE
+    NyaZyDialect
+    ${dialect_libs}
+    ${extension_libs}
+    MLIRIR
+    MLIRParser
+    MLIRPass
+    MLIRDialect 
+    MLIRTranslateLib
+    MLIRSupport
+    MLIRTransforms
+    MLIRLLVMToLLVMIRTranslation
+    MLIRBuiltinToLLVMIRTranslation
+)
+
+mlir_check_link_libraries(libNYACC)
+
+# nyaccには、main.cppをソースファイルとして指定し、libNYACCをリンクする
+target_sources(nyacc PRIVATE main.cpp)
+target_link_libraries(nyacc libNYACC)
+```
+`test/CMakeLists.txt`に、実際に`simpleTest`のリンクやソースファイル指定などの設定を書きます。テストは、`test/simpleTest.cpp`に書くことにします。
+```cmake:test/CMakeLists.txt
+# test/CMakeLists.txt
+enable_testing()  # CTestを有効にする
+
+# テストのソースファイルを指定
+set(SRC_FILES simpleTest.cpp)
+target_sources(simpleTest PRIVATE ${SRC_FILES})
+
+# テストを登録
+add_test(NAME SimpleTest COMMAND simpleTest)
+
+# テストでのみ使うLLVMのJIT関係のライブラリのリンク
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
+    list(APPEND LLVM_TARGET_COMPONENTS
+        AArch64
+        AArch64AsmParser
+        AArch64CodeGen
+        AArch64Desc
+        AArch64Disassembler
+        AArch64Info
+        AArch64Utils
+        ExecutionEngine
+        OrcJIT
+    )
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "amd64")
+    list(APPEND LLVM_TARGET_COMPONENTS
+        X86
+        X86AsmParser
+        X86CodeGen
+        X86Desc
+        X86Disassembler
+        X86Info
+        ExecutionEngine
+        OrcJIT
+    )
+else()
+    message(FATAL_ERROR "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
+# Map components to library names
+llvm_map_components_to_libnames(LLVM_TARGET_LIBS ${LLVM_TARGET_COMPONENTS})
+
+message(STATUS "LLVM_TARGET_LIBS: ${LLVM_TARGET_LIBS}")
+
+target_link_libraries(simpleTest
+    PRIVATE
+    libNYACC
+    NyaZyDialect
+    ${dialect_libs}
+    ${extension_libs}
+    MLIRIR
+    MLIRParser
+    MLIRPass
+    MLIRDialect 
+    MLIRTranslateLib
+    MLIRSupport
+    MLIRTransforms
+
+    ${LLVM_TARGET_LIBS}
+
+# google testのライブラリ
+    gtest gtest_main
+)
+
+```
+```test/simpleTest.cpp
+int add(int a, int b) {
+  return a + b;
+}
+
+TEST(SimpleTest, TestOfTest) { EXPECT_EQ(123, add(100, 23)); }
+
+int main(int argc, char **argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}
+```
+テストは`ctest --test-dir build/test --output-on-failure`で実行できます。`bin`スクリプトの`COMMAND_MAP`に`test`という名前で追加しておきます。それではGoogleTestがうまく動くが試してみましょう。
+```bash
+$ ./bin build
+$ ./bin test
+Internal ctest changing into directory: /home/lemolatoon/workspace/compiler/NyaZy/build/test
+Test project /home/lemolatoon/workspace/compiler/NyaZy/build/test
+    Start 1: SimpleTest
+1/1 Test #1: SimpleTest .......................   Passed    0.00 sec
+
+100% tests passed, 0 tests failed out of 1
+
+Total Test time (real) =   0.00 sec
+
+$ ./bin test # わざと123を124にしてfailするようにした場合
+Internal ctest changing into directory: /home/lemolatoon/workspace/compiler/NyaZy/build/test
+Test project /home/lemolatoon/workspace/compiler/NyaZy/build/test
+    Start 1: SimpleTest
+1/1 Test #1: SimpleTest .......................***Failed    0.00 sec
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from SimpleTest
+[ RUN      ] SimpleTest.TestOfTest
+/home/lemolatoon/workspace/compiler/NyaZy/test/simpleTest.cpp:7: Failure
+Expected equality of these values:
+  124
+  add(100, 23)
+    Which is: 123
+[  FAILED  ] SimpleTest.TestOfTest (0 ms)
+[----------] 1 test from SimpleTest (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 0 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] SimpleTest.TestOfTest
+
+ 1 FAILED TEST
+
+
+0% tests passed, 1 tests failed out of 1
+
+Total Test time (real) =   0.00 sec
+
+The following tests FAILED:
+          1 - SimpleTest (Failed)
+Errors while running CTest
+Error: Command 'test' failed with exit code 8
+```
+こんな感じの表記になれば、GoogleTestが正しくセットアップできています。
+
+#### NyaZyコンパイラのテストを追加する
+それではいよいよNyaZyコンパイラのテストを追加します。ここでは、ソースコードの文字列を入力として、コンパイルをした後に実行し、その実行結果のexit codeをintとして返すような関数`runNyaZy`を定義してそれに対してテストをするようにしています。`runNyaZy`内部では、これまで同様に、`Lexer`、`Parser`を通してASTにした後、MLIRの世界に持っていき、パスを適用してLLVM DialectのみのMLIRにします。これはLLVM IRに変換されます。ここまでは、これまでの`src/main.cpp`の動作と同じです。`runNyaZy`関数では、LLVM IRを実行する処理も含まれています。これは[LLVM ORC JIT API](https://llvm.org/docs/ORCv2.html)を用いて実現できます。ORCを使うと、LLVM IRを実行時にコンパイルし、実行できます。[^jit]
+この処理は、`simpleTest.cpp`内では、`runIR`関数内に処理を集結させています。LLVM IRの情報を持つ`llvm::Module`を引数として渡し、実行します。ORCを使って最終的に、JITコンパイルされた関数への関数ポインタを得ることができるので、それを実行し、その戻り値がexit codeになっているのでそれを返すようになっています。
+
+GoogleTestでは、`EXPECT_`から始まるマクロを使って、アサート文を書くことができて、そのアサートに失敗するとテストが失敗するようになっています。`EXPECT_EQ`のEQはEqualのEQです。`OneInteger`のテストでは、単一の整数をexit codeとして出力できているかを確認し、`ArithOps`のテストでは、四則演算の場合をテストしています。
+
+[^jit]: JITとは、Just-In-Timeの略で、ORCは、On-Request-Compilationの略です。JITという言葉は、LLVMの外でも使われます。例えば、インタープリター言語で何回も実行される関数を、実行中にコンパイルして高速化する手法などに使われたりします。
+```cpp:test/simpleTest.cpp
+// test/simpleTest.cpp
+#include "ir/NyaZyDialect.h"
+#include "ir/Pass.h"
+#include "lexer.h"
+#include "mlir/Pass/Pass.h"
+#include "mlirGen.h"
+#include "parser.h"
+#include "gtest/gtest.h"
+#include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+#include <llvm/Support/TargetSelect.h>
+#include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Dialect/LLVMIR/LLVMDialect.h>
+#include <mlir/IR/MLIRContext.h>
+#include <mlir/IR/Verifier.h>
+#include <mlir/Pass/PassManager.h>
+#include <mlir/Support/LLVM.h>
+#include <mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h>
+#include <mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h>
+#include <mlir/Target/LLVMIR/Export.h>
+
+int runIR(std::unique_ptr<llvm::Module> &module) {
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  llvm::InitializeNativeTargetAsmParser();
+
+  llvm::orc::ThreadSafeContext context(std::make_unique<llvm::LLVMContext>());
+
+  auto jit = llvm::orc::LLJITBuilder().create();
+  EXPECT_TRUE(!!jit) << "Error creating LLJIT: "
+                     << llvm::toString(jit.takeError()) << "\n";
+
+  // Convert the module to ThreadSafeModule and add it to JIT
+  llvm::orc::ThreadSafeModule tsm(std::move(module), context);
+  auto err = jit->get()->addIRModule(std::move(tsm));
+  EXPECT_FALSE(err) << "Error adding module: " << llvm::toString(std::move(err))
+                    << "\n";
+
+  // Specify the entry point function name (e.g., "main")
+  auto symbol = jit->get()->lookup("main");
+  EXPECT_TRUE(!!symbol) << "Error looking up symbol: "
+                        << llvm::toString(symbol.takeError()) << "\n";
+
+  auto mainFunction = symbol->toPtr<int (*)()>();
+  int status = mainFunction();
+
+  return status;
+}
+
+int runNyaZy(std::string src) {
+  nyacc::Lexer lexer(src);
+  auto tokens = lexer.tokenize();
+  nyacc::Parser parser(tokens);
+  auto ast = parser.parseModule();
+
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<nyacc::NyaZyDialect>();
+  context.getOrLoadDialect<mlir::arith::ArithDialect>();
+  context.getOrLoadDialect<mlir::LLVM::LLVMDialect>();
+  context.getOrLoadDialect<mlir::func::FuncDialect>();
+  auto module = nyacc::MLIRGen::gen(context, ast);
+
+  EXPECT_TRUE(mlir::succeeded(mlir::verify(*module)))
+      << "Module verification failed:\n"
+      << src << "\n";
+
+  mlir::PassManager pm(&context);
+  pm.addPass(nyacc::createNyaZyToLLVMPass());
+
+  EXPECT_TRUE(mlir::succeeded(pm.run(*module))) << "PassManager failed:\n"
+                                                << src << "\n";
+
+  mlir::registerBuiltinDialectTranslation(*module->getContext());
+  mlir::registerLLVMDialectTranslation(*module->getContext());
+  llvm::LLVMContext llvmContext;
+  auto llvmModule = mlir::translateModuleToLLVMIR(*module, llvmContext);
+  EXPECT_TRUE(llvmModule) << "Failed to emit LLVM IR:\n" << src << "\n";
+  llvmModule->dump();
+
+  return runIR(llvmModule);
+};
+
+TEST(SimpleTest, OneInteger) { EXPECT_EQ(123, runNyaZy("123")); }
+
+TEST(SimpleTest, ArithOps) {
+  EXPECT_EQ(3, runNyaZy("1+2"));
+  EXPECT_EQ(8, runNyaZy("1+2+5"));
+  EXPECT_EQ(4, runNyaZy("1*2+5/2"));
+  EXPECT_EQ(3, runNyaZy("1*(2+5)/2"));
+}
+
+int main(int argc, char **argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}
+```
+それでは、実際に実行し、テストが通るかを試してみましょう。逆に、こうしたら通らないはず、というテストを作りちゃんとテストが落ちることも確認しましょう。
+```bash
+$ ./bin build
+$ ./bin test
+...
+100% tests passed, 0 tests failed out of 1
+...
+```
