@@ -1125,7 +1125,13 @@ Token(NumLit, 123)
 
 #### Parserをつくる
 次に、コンパイラは`Token`の列を抽象構文木（AST: Abstract Syntax Tree）というものに変換します。この変換をすることをパースすると呼びます。NyaZyではこの処理を`Parser` classが担っています。
-まずは、ASTを表現するclassを作成します。今後、プログラミング言語における「式（Expr: Expression）」を表現するために、そのbase classとして`ExprASTNode`を定義します。さらに、数字の定数を表す派生クラスである`NumLitExpr`を定義します。
+現段階でNyaZyの構文は以下のようになっています。この記法は[BNF](https://ja.wikipedia.org/wiki/%E3%83%90%E3%83%83%E3%82%AB%E3%82%B9%E3%83%BB%E3%83%8A%E3%82%A6%E3%82%A2%E8%A8%98%E6%B3%95)と呼ばれ、文法を記述するための記法です。
+```
+module  := expr
+expr    := primary
+primary := num-lit | '(' expr ')'
+```
+まずは、ASTを表現するclassを作成します。`module`に対応するのが`ModuleAST`で、`expr`に対応するのが`ExprASTNode`です。「式（Expr: Expression）」を表現するためのbase classとして`ExprASTNode`を定義します。さらに、数字の定数を表す派生クラスである`NumLitExpr`を定義します。BNFでは`num-lit`に対応しています。
 ```cpp:include/ast.h
 #pragma once
 
@@ -2533,6 +2539,15 @@ Token(Eof, )
 
 アウトラインとしては、`include/ast.h`、`src/ast.cpp`を修正し、演算に対応するノードを定義します。その後、`include/parser.h`と`src/parser.cpp`を修正し、トークン列から追加したノードへのパース部分の実装を追加します。
 パースするときには、演算子の優先順位を考える必要があります。具体的には、優先順位が低い順にパースしていくことで、望んだASTが得られます。たとえば、`1 + 2 * 3`を考えるとき、まずは、`Expr + Expr`からパースすることで、`(1) + (2 * 3)`として見たあと、`Expr * Expr`をパースすることで、`(1) + ((2) * (3))`となります。（ここでは、カッコで囲んだ整数をパースしたExprとしてみなしています。）
+構文は以下のようになります。
+```
+module  := expr
+expr    := mul
+           | mul ('+' | '-') expr
+mul     := primary
+           | primary ('*' | '/') primary
+primary := num-lit | '(' expr ')'
+```
 
 まずは、ノードを足していきます。`BinaryExpr`は、二項演算式全般を表すクラスです。`enum class BinaryOp`を内部で持っており、これが演算を表しています。今のところは、四則演算のみです。
 ```cpp:include/ast.h
@@ -3421,7 +3436,7 @@ add_subdirectory(include)
 include_directories(${CMAKE_BINARY_DIR}/include)
 
 # .tdファイルの依存の記述はそれぞれに対して書いておく
-add_dependencies(libNYACC MLIRNyaZyDialectIncGen)
+add_dependencies(libNYACC MLIRNyaZyOpsIncGen)
 add_dependencies(libNYACC MLIRNyaZyDialectIncGen)
 
 add_dependencies(nyacc MLIRNyaZyOpsIncGen)
@@ -4165,3 +4180,319 @@ Error: unkown-file:2:7: error: Unexpected character: &
 Error: Command 'nyacc' failed with exit code 1
 ```
 行、列と、`^`とともに親切なエラーが出力されました！
+### Step6 単項演算子'+' '-'を追加する
+[該当コミット](https://github.com/lemolatoon/NyaZy/commit/9cbc7bdc353b8b2e5b266057b6cc322dae13d9ba) [差分プルリクエスト](https://github.com/lemolatoon/NyaZy/pull/7)
+```bash
+$ git checkout d19d02f7dd3c60bd9db1c0c7b9a5eca9b5938fb9
+```
+Step3で四則演算を追加したときと同じような感じで、`Parser`、`NyaZyOps.td`、`MLIRGen`、`LowerToLLVMPass`の順番で手を加えていきます。`Lexer`は、すでに`+`と`-`のトークンがあるので手を加える必要はないです。このStepを終えると次のようなプログラムをコンパイルできるようになります。
+```nyazy:sample.nz
+(-2) * (+2)
+```
+#### Parserの実装
+まずは、UnaryExpressionを表すclassを`include/ast.h`に定義します。`BinaryExpr`に`enum BinaryOp`を持たせたように、`UnaryExpr`に`enum UnaryExpr`を持たせるようにすることにします。`ExprKind::Unary`と、`Visitor::visit(const UnaryExpr&)`を足すのを忘れないようにしてください。
+```cpp:include/ast.h
+#pragma once
+
+#include <cstdint>
+#include <memory>
+
+namespace nyacc {
+class Visitor {
+public:
+  virtual ~Visitor() = default;
+  // ...
+  virtual void visit(const class UnaryExpr &node) = 0;
+};
+
+class ExprASTNode {
+public:
+  enum class ExprKind {
+    NumLit,
+    Unary,
+    Binary,
+  };
+  explicit ExprASTNode(ExprKind kind) : kind_(kind) {}
+  virtual ~ExprASTNode() = default;
+  virtual void accept(class Visitor &v) = 0;
+  virtual void dump(int level) const = 0;
+  ExprKind getKind() const { return kind_; };
+
+private:
+  ExprKind kind_;
+};
+
+// 略
+
+enum class UnaryOp {
+  Plus,
+  Minus,
+};
+
+static inline const char *UnaryOpToStr(UnaryOp op) {
+  switch (op) {
+  case UnaryOp::Plus:
+    return "+";
+  case UnaryOp::Minus:
+    return "-";
+  }
+}
+
+class UnaryExpr : public ExprASTNode {
+public:
+  UnaryExpr(std::unique_ptr<ExprASTNode> expr, UnaryOp op)
+      : ExprASTNode(ExprKind::Unary), expr_(std::move(expr)), op_(op) {}
+
+  void accept(Visitor &v) override { v.visit(*this); }
+
+  void dump(int level) const override;
+  const UnaryOp &getOp() const { return op_; }
+  const std::unique_ptr<ExprASTNode> &getExpr() const { return expr_; }
+
+  static bool classof(const ExprASTNode *node) {
+    return node->getKind() == ExprKind::Unary;
+  }
+
+private:
+  std::unique_ptr<ExprASTNode> expr_;
+  UnaryOp op_;
+};
+// 中略
+} // namespace nyacc
+```
+デバッグプリント用の実装も`src/ast.cpp`に足します。
+```cpp:src/ast.cpp
+#include "ast.h"
+#include <iostream>
+
+namespace nyacc {
+// ...
+void UnaryExpr::dump(int level) const {
+  std::cout << std::string(level * 2, ' ') << "UnaryExpr(\n";
+  std::cout << std::string((level + 1) * 2, ' ') << UnaryOpToStr(op_) << "\n";
+  expr_->dump(level + 1);
+  std::cout << std::string(level * 2, ' ') << ")\n";
+}
+// ...
+} // namespace nyacc
+```
+ASTが単項演算に対応したので、パーサーも拡張します。`include/parser.h`と`src/parser.cpp`です。単項演算が足されると構文は以下のようになります。`parseExpr` → `parseMul` → `parsePrimary`として呼ばれていたところに、`parseUnary`が入り、`parseExpr` → `parseMul` → `parseUnary` → `parsePrimary`のような順番で呼ばれていくことになります。
+```
+module  := expr
+expr    := mul
+           | mul ('+' | '-') expr
+mul     := unary
+           | unary ('*' | '/') unary
+unary   := primary
+           | ('+' | '-') primary
+primary := num-lit | '(' expr ')'
+```
+```cpp:include/parser.h
+// ...
+namespace nyacc {
+class Parser {
+public:
+  // ...
+private:
+  // 追加
+  std::unique_ptr<ExprASTNode> parseUnary();
+  // ...
+};
+} // namespace nyacc
+```
+```cpp:src/parser.cpp
+#include "parser.h"
+#include "ast.h"
+#include <charconv>
+#include <iostream>
+#include <memory>
+
+namespace nyacc {
+
+// ...
+std::unique_ptr<ExprASTNode> Parser::parseUnary() {
+  const auto &token = tokens_[pos_];
+
+  switch (token.getKind()) {
+  case Token::TokenKind::Plus:
+  case Token::TokenKind::Minus: {
+    UnaryOp op = token.getKind() == Token::TokenKind::Plus ? UnaryOp::Plus
+                                                           : UnaryOp::Minus;
+    pos_++;
+    auto expr = parsePrimary();
+    return std::make_unique<UnaryExpr>(std::move(expr), op);
+  }
+  default:
+    return parsePrimary();
+  }
+}
+
+// ...
+} // namespace nyacc
+```
+これまでのように、`src/main.cpp`を編集して、`(-2) * (+2)`などを渡すと、パース結果を確認できると思います。
+```
+$ ./bin nyacc
+...
+ModuleAST
+  BinaryExpr(
+    UnaryExpr(
+      -
+      NumLitExpr(2)
+    )
+    *
+    UnaryExpr(
+      +
+      NumLitExpr(2)
+    )
+  )
+```
+
+#### MLIRGenの実装
+まず、単項演算'+'・'-'に対応するNyaZyDialectのOpである、`PosOp`と`NegOp`を定義します。`include/ir/NyaZyOps.td`を編集します。
+```
+#ifndef NYAZY_OPS
+#define NYAZY_OPS
+
+include "NyaZyDialect.td"
+include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/IR/OpAsmInterface.td"
+include "mlir/Interfaces/InferIntRangeInterface.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/IR/BuiltinAttributeInterfaces.td"
+include "mlir/Interfaces/CallInterfaces.td"
+include "mlir/Interfaces/FunctionInterfaces.td"
+include "mlir/IR/SymbolInterfaces.td"
+
+// ...
+
+//===----------------------------------------------------------------------===//
+// PosOp
+//===----------------------------------------------------------------------===//
+def PosOp : NyaZyOp<"pos",
+    [Pure]> {
+  let summary = "unary positive operation";
+  let description = [{
+    The "nyazy.pos" operation represents the unary positive operation.
+  }];
+
+  let arguments = (ins I64:$lhs);
+  let results = (outs I64);
+}
+
+//===----------------------------------------------------------------------===//
+// NegOp
+//===----------------------------------------------------------------------===//
+def NegOp : NyaZyOp<"neg",
+    [Pure]> {
+  let summary = "unary negative operation";
+  let description = [{
+    The "nyazy.pos" operation represents the unary negative operation.
+  }];
+
+  let arguments = (ins I64:$operand);
+  let results = (outs I64);
+}
+
+// ...
+
+#endif // NYAZY_OPS
+```
+`nyazy.pos`と`nyazy.neg`を定義できたので、`MLIRGenVisitor`で、`UnaryExpr`に対する`visit`でこれらを生成するようにします。`src/mlirGen.cpp`を編集します。`getOp`で`enum UnaryOp`を取得して、それによって`PosOp`を作るか、`NegOp`を作るのかを決めます。
+```cpp:src/mlirGen.cpp
+#include "mlirGen.h"
+#include "ast.h"
+#include "ir/NyaZyDialect.h"
+#include "ir/NyaZyOps.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include <iostream>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
+
+namespace {
+
+class MLIRGenVisitor : public nyacc::Visitor {
+public:
+  // ...
+  void visit(const nyacc::UnaryExpr &unaryExpr) override {
+    unaryExpr.getExpr()->accept(*this);
+    auto expr = value_.value();
+    switch (unaryExpr.getOp()) {
+    case nyacc::UnaryOp::Plus: {
+      value_ = builder_.create<nyacc::PosOp>(builder_.getUnknownLoc(), expr);
+      break;
+    }
+    case nyacc::UnaryOp::Minus: {
+      value_ = builder_.create<nyacc::NegOp>(builder_.getUnknownLoc(), expr);
+      break;
+    }
+    }
+  }
+
+};
+// ...
+
+} // namespace
+// ...
+```
+ここまで加えて実行すると、NyaZyDialectで表現されたMLIRが見られるはずです！
+```bash
+$ ./bin nyacc
+...
+module {
+  nyazy.func @main() {
+    %0 = nyazy.constant 2 : i64
+    %1 = "nyazy.neg"(%0) : (i64) -> i64
+    %2 = nyazy.constant 2 : i64
+    %3 = "nyazy.pos"(%2) : (i64) -> i64
+    %4 = "nyazy.mul"(%1, %3) : (i64, i64) -> i64
+    "nyazy.return"(%4) : (i64) -> ()
+  }
+}
+```
+#### Loweringの実装
+`nyazy.pos`と`nyazy.neg`の変換を実装します。`nyazy.pos`は実際何もしないので、そのオペランドで置き換えるようにします。`nyazy.neg`は、その数を`0`から引くような演算に変換します。その演算部分はArith Dialectの言葉を使って書くことにします。これまでと同様に、`src/ir/lowerToLLVM.cpp`に、`PosOpLowering`と`NegOpLowering`を追加します。それを`LowerToLLVM::runOnOperation`の`RewritePatternSet`のaddで追加されるようにします。
+```cpp:src/ir/lowerToLLVM.cpp
+struct PosOpLowering : public mlir::OpConversionPattern<nyacc::PosOp> {
+  PosOpLowering(mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<nyacc::PosOp>(ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(nyacc::PosOp op, nyacc::PosOp::Adaptor adaptor [[maybe_unused]],
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto unaryOp = mlir::cast<nyacc::PosOp>(op);
+    rewriter.replaceOp(op, unaryOp.getOperand());
+
+    return mlir::success();
+  }
+};
+
+struct NegOpLowering : public mlir::OpConversionPattern<nyacc::NegOp> {
+  NegOpLowering(mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<nyacc::NegOp>(ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(nyacc::NegOp op, nyacc::NegOp::Adaptor adaptor [[maybe_unused]],
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto unaryOp = mlir::cast<nyacc::NegOp>(op);
+    auto cst0 = rewriter.create<mlir::arith::ConstantOp>(
+        op->getLoc(), rewriter.getI64Type(), rewriter.getI64IntegerAttr(0));
+    rewriter.replaceOp(op, rewriter.create<mlir::arith::SubIOp>(
+                               op->getLoc(), cst0, unaryOp.getOperand()));
+
+    return mlir::success();
+  }
+};
+// ...
+void NyaZyToLLVMPass::runOnOperation() {
+  // ...
+  mlir::RewritePatternSet patterns(&getContext());
+  // nyazy -> arith + func
+  patterns.add<ConstantOpLowering, FuncOpLowering, ReturnOpLowering,
+               AddOpLowering, SubOpLowering, MulOpLowering, DivOpLowering, PosOpLowering, NegOpLowering>(
+      &getContext());
+
+  // ...
+}
+```
