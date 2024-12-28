@@ -5065,3 +5065,241 @@ Error: Command 'nyacc' failed with exit code 1
 エラーになってしまいました。これは、`nyazy.cmp`が`i1`を返しているのにも関わらず、`main`関数の戻り型が`i64`になっているのが原因です。C言語などでは、暗黙的型変換があったりしますが、NyaZyでは、型は明示的に変換する必要があるということにします。これはStep8で実装していきます！
 
 ### Step8 型変換を実装する
+[該当コミット](https://github.com/lemolatoon/NyaZy/commit/81496cc8528d3dc4334ea3121742f773d4459e0a) [差分プルリクエスト](https://github.com/lemolatoon/NyaZy/pull/9)
+```bash
+$ git checkout 81496cc8528d3dc4334ea3121742f773d4459e0a
+```
+このStepでは、型変換を行う`as`構文を追加します。
+```nz:sample.nz
+(3 == 3) as i64
+```
+このようにすることで、比較演算の結果の型である`i1`をmain関数の戻り型である`i64`に変換できるようにします。BNFは以下のようになります。`postfix`が増えています。
+```
+module  := expr
+expr    := compare
+compare := add
+           | add ('==' | '>=' | '>' | '<=' | '<') compare
+add     := mul
+           | mul ('+' | '-') expr
+mul     := unary
+           | unary ('*' | '/') unary
+unary   := postfix
+           | ('+' | '-') postfix
+postfix := primary
+           | primary 'as' type
+primary := num-lit | '(' expr ')'
+
+type    := 'i'{int}
+```
+
+#### Lexerの修正
+では、まずLexerを整備します。`as`対応するトークンと、識別子(Ident)に対応するトークンを追加します。`include/lexer.h`と`src/lexer.cpp`を編集します。
+```cpp:include/lexer.h
+  enum class TokenKind {
+    NumLit,
+    Ident, // i64やi1など、名前なんでも
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    OpenParen,
+    CloseParen,
+    Eq,
+    Gt,
+    Lt,
+    As, // as
+    Eof,
+  };
+  static const char *tokenKindToString(TokenKind kind) {
+    // ...
+    case TokenKind::Lt:
+      return "Lt";
+    case TokenKind::As:
+      return "As";
+    case TokenKind::Ident:
+      return "Ident";
+      break;
+    }
+  }
+
+  // その他便利関数の宣言も追加
+  bool startsWith(std::string_view sv) const;
+  bool startsWithSpace(bool includesNewline = false) const;
+```
+```cpp:src/lexer.cpp
+// 便利関数の実装
+// スペースから始まるか
+bool Lexer::startsWithSpace(bool includesNewline) const {
+  char c = input_[pos_];
+  return (includesNewline && c == '\n') || c == '\t' || c == ' ' || c == '\r';
+}
+
+// ある文字列から始まるか
+bool Lexer::startsWith(std::string_view sv) const {
+  if (pos_ + sv.size() > input_.size()) {
+    return false;
+  }
+
+  for (size_t i = 0; i < sv.size(); i++) {
+    if (input_[pos_ + i] != sv[i]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+Lexer::tokenize() {
+  // ...
+  if (input_[pos_] == '\n') {
+    nextLine();
+    continue;
+  }
+
+  if (startsWithSpace(false)) {
+    advance();
+    continue;
+  }
+  // 2文字以上のトークンとTokenKindの対応
+  const auto long_token_mapping = {
+      std::pair<std::string_view, Token::TokenKind>{"as",
+                                                    Token::TokenKind::As},
+  };
+
+  // long_token_mappingの文字から始まるなら、そのトークンをemplace_backする
+  for (const auto &[c, kind] : long_token_mapping) {
+    if (startsWith(c)) {
+      tokens.emplace_back(kind, input_.substr(pos_, c.size()),
+                          currentLocation());
+      advanceN(c.size());
+      shouldContinue = true; // 外側のwhileに対してcontinueするため
+      break;
+    }
+  }
+  if (shouldContinue) {
+    continue;
+  }
+
+  // Identかどうか
+  if (!atEof() && !startsWithSpace()) {
+    const size_t startPos = pos_;
+    advance();
+    // Identなら、スペースが来るまで進める
+    while (!atEof() && !startsWithSpace()) {
+      advance();
+    }
+    // pos_ - startPosがIdentの長さ
+    tokens.emplace_back(Token::TokenKind::Ident,
+                        input_.substr(startPos, pos_ - startPos),
+                        currentLocation());
+    continue;
+  }
+}
+```
+修正したLexerを確認してみましょう。
+```bash
+$ ./bin build
+$ ./bin nyacc
+Source code:
+
+  (3 == 3) as i64
+Tokens:
+Token(OpenParen, ()
+Token(NumLit, 3)
+Token(Eq, =)
+Token(Eq, =)
+Token(NumLit, 3)
+Token(CloseParen, ))
+Token(As, as)
+Token(Ident, i64)
+Token(Eof, )
+```
+`as`がAsとして認識され、`i64`がIdentとして認識されているのが分かります。
+
+#### Parserの修正
+まずは、`CastExpr`をASTのノードして新たに追加します。`include/ast.h`です。また、型を表す`class Type`と、castできるような型を表す`class PrimitiveType`を`include/types.h`に定義します。`PrimitiveType`は、`PrimitiveType::Kind`とbit長を表す`int bitWidth_`を持ちます。また、`class Type`は`PrimitiveType`の親クラスになっていてLLVMスタイルのRTTIを採用しています。
+```cpp:include/ast.h
+#pragma once
+
+#include "types.h"
+#include <cstdint>
+#include <memory>
+
+class Visitor {
+public:
+  virtual ~Visitor() = default;
+  virtual void visit(const class ModuleAST &node) = 0;
+  virtual void visit(const class NumLitExpr &node) = 0;
+  virtual void visit(const class BinaryExpr &node) = 0;
+  virtual void visit(const class CastExpr &node) = 0; // new
+  virtual void visit(const class UnaryExpr &node) = 0;
+};
+
+class CastExpr : public ExprASTNode {
+public:
+  CastExpr(std::unique_ptr<ExprASTNode> expr, PrimitiveType type)
+      : ExprASTNode(ExprKind::Cast), expr_(std::move(expr)), type_(type) {}
+  void accept(Visitor &v) override { v.visit(*this); }
+
+  static bool classof(const ExprASTNode *node) {
+    return node->getKind() == ExprKind::Cast;
+  }
+
+  void dump(int level) const override;
+  const std::unique_ptr<ExprASTNode> &getExpr() const { return expr_; }
+  const PrimitiveType &getCastTo() const { return type_; }
+
+private:
+  std::unique_ptr<ExprASTNode> expr_;
+  PrimitiveType type_;
+};
+```
+```cpp:include/types.h
+#pragma once
+#include <cstddef>
+#include <iostream>
+namespace nyacc {
+
+class Type {
+public:
+  enum class TypeKind {
+    Primitive,
+  };
+  explicit Type(TypeKind kind) : kind_(kind) {}
+  virtual ~Type() = default;
+
+  TypeKind getKind() const { return kind_; }
+  static const char *stringifyTypeKind(TypeKind);
+
+private:
+  TypeKind kind_;
+};
+
+class PrimitiveType : public Type {
+public:
+  enum class Kind {
+    SInt,
+  };
+  PrimitiveType(Kind primitiveKind, size_t bitWidth)
+      : Type(Type::TypeKind::Primitive), primitiveKind_(primitiveKind),
+        bitWidth_(bitWidth) {}
+
+  static bool classof(const Type *ty) {
+    return ty->getKind() == TypeKind::Primitive;
+  }
+
+  Kind getPrimitiveKind() const { return primitiveKind_; }
+  static const char *stringifyPrimitiveKind(Kind);
+  size_t getBitWidth() const { return bitWidth_; }
+
+private:
+  Kind primitiveKind_;
+  size_t bitWidth_;
+};
+
+} // namespace nyacc
+std::ostream &operator<<(std::ostream &os, const nyacc::Type *type);
+
+```
+```cpp:src/ast.h
+```
