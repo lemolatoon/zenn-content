@@ -4453,6 +4453,7 @@ module {
 ```
 #### Loweringの実装
 `nyazy.pos`と`nyazy.neg`の変換を実装します。`nyazy.pos`は実際何もしないので、そのオペランドで置き換えるようにします。`nyazy.neg`は、その数を`0`から引くような演算に変換します。その演算部分はArith Dialectの言葉を使って書くことにします。これまでと同様に、`src/ir/lowerToLLVM.cpp`に、`PosOpLowering`と`NegOpLowering`を追加します。それを`LowerToLLVM::runOnOperation`の`RewritePatternSet`のaddで追加されるようにします。
+`PosOpLowering`では、`nyazy.pos`そのものを、`nyazy.pos`のオペランドと入れ替えます。整数に対しては`nyazy.pos`は何も変化させないからです。`NegOpLowering`では、まず`arith.constant`で定数0を作り、それとオペランドで`nyazy.subi`を作りそれと`nyazy.neg`を入れ替えます。
 ```cpp:src/ir/lowerToLLVM.cpp
 struct PosOpLowering : public mlir::OpConversionPattern<nyacc::PosOp> {
   PosOpLowering(mlir::MLIRContext *ctx)
@@ -4495,4 +4496,43 @@ void NyaZyToLLVMPass::runOnOperation() {
 
   // ...
 }
+```
+ではこれで実行してみましょう。
+```bash
+$ ./bin build
+$ ./bin nyacc
+Source code:
+  (-2) * (+2)
+...
+Lowered MLIR:
+module {
+  llvm.func @main() -> i64 {
+    %0 = llvm.mlir.constant(2 : i64) : i64
+    %1 = llvm.mlir.constant(0 : i64) : i64
+    %2 = llvm.sub %1, %0 : i64
+    %3 = llvm.mlir.constant(2 : i64) : i64
+    %4 = llvm.mul %2, %3 : i64
+    llvm.return %4 : i64
+  }
+}
+Generated LLVM IR:
+; ModuleID = 'LLVMDialectModule'
+source_filename = "LLVMDialectModule"
+
+define i64 @main() {
+  ret i64 -4
+}
+$ ./bin lli output.ll
+$ echo $? # fishなら`echo $status`
+252
+```
+単項演算子が正しく動作していそうです。Step4でテストの機能を追加していたので、`test/simpleTest.cpp`にテストも追加しておきます。`./bin test`で通ることも確認しましょう。
+```cpp:test/simpleTest.cpp
+// ...
+TEST(SimpleTest, ArithOps) {
+  // ...
+  EXPECT_EQ(3, runNyaZy("+2+1"));
+  EXPECT_EQ(-1, runNyaZy("-2+1"));
+}
+// ...
 ```
