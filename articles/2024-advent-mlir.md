@@ -4536,3 +4536,532 @@ TEST(SimpleTest, ArithOps) {
 }
 // ...
 ```
+
+### Step7 比較演算を実装する
+[該当コミット](https://github.com/lemolatoon/NyaZy/commit/5efbf2e552d1244aa1284f409ee70583977e63d4) [差分プルリクエスト](https://github.com/lemolatoon/NyaZy/pull/8)
+```bash
+$ git checkout 5efbf2e552d1244aa1284f409ee70583977e63d4
+```
+このStepでは`==`や`>=`などの比較演算子を実装します。これは後の`while`を実装するパートの条件式の部分で使えるようにするための準備です。いままでの整数演算の結果はすべて64bit符号付き整数として扱ってきました。比較演算の結果も64bitにして、`1`か`0`かの値を返すような実装にしてもいいのですが、せっかくなので、1bit整数の値を返すことにしようと思います。MLIRでもLLVMでも、任意bit長の整数を扱うことができます。
+
+#### Lexerで比較演算子をトークナイズする
+まずは、Lexerに手を加えて、比較演算子を一つのトークンとして扱えるようにします。`include/lexer.h`と、`src/lexer.cpp`を編集します。
+```cpp:include/lexer.h
+class Token {
+public:
+  enum class TokenKind {
+    NumLit,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    OpenParen,
+    CloseParen,
+    Eq, // =
+    Gt, // >
+    Lt, // <
+    Eof,
+  };
+  static const char *tokenKindToString(TokenKind kind) {
+    switch (kind) {
+    case TokenKind::NumLit:
+      return "NumLit";
+    case TokenKind::Plus:
+      return "Plus";
+    case TokenKind::Minus:
+      return "Minus";
+    case TokenKind::Star:
+      return "Star";
+    case TokenKind::Slash:
+      return "Slash";
+    case TokenKind::OpenParen:
+      return "OpenParen";
+    case TokenKind::CloseParen:
+      return "CloseParen";
+    case TokenKind::Eof:
+      return "Eof";
+    case TokenKind::Eq:
+      return "Eq";
+    case TokenKind::Gt:
+      return "Gt";
+    case TokenKind::Lt:
+      return "Lt";
+    }
+  }
+  // ...
+};
+```
+```cpp:src/lexer.cpp
+const auto token_mapping = {
+    std::pair<char, Token::TokenKind>{'+', Token::TokenKind::Plus},
+    {'-', Token::TokenKind::Minus},
+    {'*', Token::TokenKind::Star},
+    {'/', Token::TokenKind::Slash},
+    {'(', Token::TokenKind::OpenParen},
+    {')', Token::TokenKind::CloseParen},
+    // 追加
+    {'=', Token::TokenKind::Eq},
+    {'>', Token::TokenKind::Gt},
+    {'<', Token::TokenKind::Lt},
+};
+```
+`src/main.cpp`の`src`を`-2 == 4`にして実行してみましょう。
+```bash
+$ ./bin nyacc
+Tokens:
+Token(Minus, -)
+Token(NumLit, 2)
+Token(Eq, =)
+Token(Eq, =)
+Token(NumLit, 4)
+Token(Eof, )
+```
+うまくいってそうです。
+
+#### Parserで比較演算子をパースする
+BNFは次のように変更します。
+```
+module  := expr
+expr    := compare
+compare := add
+           | add ('==' | '>=' | '>' | '<=' | '<') compare
+add     := mul
+           | mul ('+' | '-') expr
+mul     := unary
+           | unary ('*' | '/') unary
+unary   := primary
+           | ('+' | '-') primary
+primary := num-lit | '(' expr ')'
+```
+まず、`include/ast.h`を変更して、`BinaryOp`として、比較演算子のノードを実現します。
+```cpp:include/ast.h
+enum class BinaryOp {
+  Add,
+  Sub,
+  Mul,
+  Div,
+  // ↓追加
+  Eq,
+  Gte,
+  Gt,
+  Lte,
+  Lt,
+};
+
+static inline const char *BinaryOpToStr(BinaryOp op) {
+  switch (op) {
+  case BinaryOp::Add:
+    return "+";
+  case BinaryOp::Sub:
+    return "-";
+  case BinaryOp::Mul:
+    return "*";
+  case BinaryOp::Div:
+    return "/";
+  // ↓追加
+  case BinaryOp::Eq:
+    return "==";
+  case BinaryOp::Gte:
+    return ">=";
+  case BinaryOp::Gt:
+    return ">";
+  case BinaryOp::Lte:
+    return "<=";
+  case BinaryOp::Lt:
+    return "<";
+  }
+}
+```
+それでは、`include/paser.h`と`include/paser.cpp`を編集して、パーサーを実装します。`Parser::starts_with`という便利関数を追加して、先頭のトークン列が、引数で渡したトークン列に一致するかどうかを判定できるようにします。`src/parser.cpp`では、これまで、`parseExpr`で足し算のパースをしていた部分を`parseAdd`へ移動させ、比較演算子のパースは`parseCompare`で行っています。これまでの二項演算子と同じように、比較演算子が出現する限り、`while`文で回して`lhs`を更新していきます。
+```cpp:include/parser.h
+#pragma once
+
+#include "ast.h"
+#include "lexer.h"
+
+namespace nyacc {
+class Parser {
+public:
+  Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)), pos_(0) {}
+
+  ModuleAST parseModule();
+
+private:
+  std::unique_ptr<ExprASTNode> parseExpr();
+  // ===追加↓
+  std::unique_ptr<ExprASTNode> parseCompare();
+  std::unique_ptr<ExprASTNode> parseAdd();
+  // ===追加↑
+  std::unique_ptr<ExprASTNode> parseMul();
+  std::unique_ptr<ExprASTNode> parseUnary();
+  std::unique_ptr<ExprASTNode> parsePrimary();
+
+  // 現在の先頭トークンが一致するか判定する便利関数
+  bool startsWith(std::initializer_list<Token::TokenKind> list) const;
+};
+} // namespace nyacc
+```
+```cpp:src/parser.cpp
+#include "parser.h"
+#include "ast.h"
+#include <charconv>
+#include <initializer_list>
+#include <iostream>
+#include <memory>
+
+namespace nyacc {
+
+ModuleAST Parser::parseModule() {
+  auto expr = parseExpr();
+  return ModuleAST(std::move(expr));
+}
+
+std::unique_ptr<ExprASTNode> Parser::parseExpr() { return parseCompare(); }
+
+std::unique_ptr<ExprASTNode> Parser::parseCompare() {
+  auto lhs = parseAdd();
+
+  while (true) {
+    BinaryOp op;
+    if (startsWith({Token::TokenKind::Eq, Token::TokenKind::Eq})) {
+      pos_ += 2;
+      op = BinaryOp::Eq;
+    } else if (startsWith({Token::TokenKind::Gt, Token::TokenKind::Eq})) {
+      pos_ += 2;
+      op = BinaryOp::Gte;
+    } else if (startsWith({Token::TokenKind::Gt})) {
+      pos_ += 1;
+      op = BinaryOp::Gt;
+    } else if (startsWith({Token::TokenKind::Lt, Token::TokenKind::Eq})) {
+      pos_ += 2;
+      op = BinaryOp::Lte;
+    } else if (startsWith({Token::TokenKind::Lt})) {
+      pos_ += 1;
+      op = BinaryOp::Lt;
+    } else {
+      return lhs;
+    }
+    auto rhs = parseAdd();
+    lhs = std::make_unique<BinaryExpr>(std::move(lhs), std::move(rhs), op);
+    continue;
+  }
+}
+// ...
+bool Parser::startsWith(std::initializer_list<Token::TokenKind> tokens) const {
+  if (pos_ + tokens.size() > tokens_.size()) {
+    return false;
+  }
+  auto it = tokens.begin();
+  for (size_t i = 0; i < tokens.size(); i++) {
+    if (tokens_[pos_ + i].getKind() != *it) {
+      return false;
+    }
+    it++;
+  }
+  return true;
+}
+
+};
+} // namespace nyacc
+```
+パーサー完成時点での動作を確認しましょう。`switch`文周りで`case`が足りないとエラーが出たら適当に足してとりあえずコンパイルが通るようにしてください。
+```bash
+$ ./bin build
+$ ./bin nyacc
+Source code:
+  -2 == 4
+...
+ModuleAST
+  BinaryExpr(
+    UnaryExpr(
+      -
+      NumLitExpr(2)
+    )
+    ==
+    NumLitExpr(4)
+  )
+```
+見た感じ正しくパースされていそうです！
+
+#### MLIRGen: 比較演算子をMLIRの世界へ持ち込む
+まずは、NyaZyDialectに`Cmp`命令を追加します。これは、整数比較を行う命令にし、その実装のほとんどは、[arith.cmpi](https://mlir.llvm.org/docs/Dialects/ArithOps/#arithcmpi-arithcmpiop)をパクることにします。今回、比較演算子としては、`eq`、`ne`、`gte`、`gt`、`lte`、`lt`の6つがありますが、NyaZy Dialect上に5つの命令を追加するわけではありません。`Cmp`命令に`enum`の`attribute`を持たせて、それぞれを見分けることにします。MLIRの命令における[`attribute`](https://mlir.llvm.org/docs/LangRef/#attributes)とは、コンパイル時に決まる定数のことでした。
+
+ODS上で、attributeのためのenumを定義するには、[Enum attributes](https://mlir.llvm.org/docs/DefiningDialects/Operations/#enum-attributes)というものを使います。実際に、`include/ir/NyaZyBase.td`に`NyaZy_CmpPredicateAttr`を定義します。以下のように、`I64EnumAttr`を継承するように定義できます。`eq`には0を、`ne`には1を割り当て、、、といった感じです。
+```td:include/ir/NyaZyBase.td
+#ifndef NYAZY_BASE
+#define NYAZY_BASE
+
+include "mlir/IR/EnumAttr.td"
+include "mlir/IR/OpBase.td"
+
+def NyaZy_CmpPredicateAttr : I64EnumAttr<
+    "CmpPredicate", "", // CmpPredicateはC++側での名前
+    [
+      I64EnumAttrCase<"eq", 0>,
+      I64EnumAttrCase<"ne", 1>,
+      I64EnumAttrCase<"lt", 2>,
+      I64EnumAttrCase<"le", 3>,
+      I64EnumAttrCase<"gt", 4>,
+      I64EnumAttrCase<"ge", 5>,
+    ]> {
+  let cppNamespace = "::nyacc";
+}
+
+#endif // NYAZY_BASE
+```
+実際にこれを使うのは、`nyazy.cmp`命令を定義するときです。`include/ir/NyaZyOps.td`を編集して、`CmpOp`を追加します。`include "NyaZyBase.td`とすることで、`arguments`の部分で、`NyaZy_CmpPredicateAttr`を指定できるようになっています。C++側からは、`nyacc::CompPredicate`でアクセスできるので、それを取得する`getPredicateByName`という便利関数を宣言しておきます。
+```td:include/ir/NyaZyOps.td
+#ifndef NYAZY_OPS
+#define NYAZY_OPS
+
+include "NyaZyDialect.td"
+include "NyaZyBase.td" // includeを追加
+include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/IR/OpAsmInterface.td"
+include "mlir/Interfaces/InferIntRangeInterface.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/IR/BuiltinAttributeInterfaces.td"
+include "mlir/Interfaces/CallInterfaces.td"
+include "mlir/Interfaces/FunctionInterfaces.td"
+include "mlir/IR/SymbolInterfaces.td"
+include "mlir/Interfaces/CastInterfaces.td"
+include "mlir/Interfaces/MemorySlotInterfaces.td"
+
+def CmpOp
+  : NyaZyOp<"cmp",
+    [Pure]> {
+  let summary = "comparison operation";
+  let description = [{
+    The `cmp` operation is a generic comparison for any types in nyazy. Its two
+    arguments can be any types as long as their types
+    match. The operation produces an i1 for the all cases.
+
+    Its first argument is an attribute that defines which type of comparison is
+    performed. The following comparisons are supported:
+
+    -   equal (mnemonic: `"eq"`; integer value: `0`)
+    -   not equal (mnemonic: `"ne"`; integer value: `1`)
+    -   less than (mnemonic: `"lt"`; integer value: `2`)
+    -   less than or equal (mnemonic: `"le"`; integer value: `3`)
+    -   greater than (mnemonic: `"gt"`; integer value: `4`)
+    -   greater than or equal (mnemonic: `"ge"`; integer value: `5`)
+
+    The result is `1` if the comparison is true and `0` otherwise.
+
+    Note: while the custom assembly form uses strings, the actual underlying
+    attribute has integer type (or rather enum class in C++ code) as seen from
+    the generic assembly form. String literals are used to improve readability
+    of the IR by humans.
+  }];
+
+  let arguments = (ins NyaZy_CmpPredicateAttr:$predicate,
+                       AnyType:$lhs,
+                       AnyType:$rhs);
+  let results = (outs I1);
+
+  let extraClassDeclaration = [{
+    static std::optional<nyacc::CmpPredicate> getPredicateByName(mlir::StringRef name);
+  }];
+
+  let assemblyFormat = "$predicate `,` $lhs `,` $rhs attr-dict `:` type($lhs) `vs` type($rhs)";
+}
+#endif // NYAZY_OPS
+```
+`NyaZyOps.td`のC++ファイルへの変換部分はすでにいままでのもので機能しますが、`NyaZyBase.td`のための設定はしなければいけません。まず、`include/ir/CMakeLists.txt`を編集して、`mlir_tablegen`の呼び出しを追加します。
+```cmake:include/ir/CMakeLists.txt
+mlir_tablegen(NyaZyOpsEnums.h.inc -gen-enum-decls) # 宣言
+mlir_tablegen(NyaZyOpsEnums.cpp.inc -gen-enum-defs) # 定義
+```
+`NyaZyOpsEnums.h.inc`は、`include/ir/NyaZyOpsEnums.h`でラップし、`NyaZyOpsEnums.cpp.inc`は、`src/ir/NyaZyOpsEnums.cpp`からラップすることにします。
+```cpp:include/ir/NyaZyOpsEnums.h
+#include <llvm/ADT/StringRef.h>
+#include <mlir/IR/BuiltinAttributes.h>
+#include "mlir/IR/BuiltinTypes.h"
+#include <optional>
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wall"
+#pragma GCC diagnostic ignored "-Wextra"
+
+#include "ir/NyaZyOpsEnums.h.inc"
+
+#pragma GCC diagnostic pop
+```
+```cpp:src/ir/NyaZyOpsEnums.cpp
+#include "ir/NyaZyOpsEnums.h"
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wall"
+#pragma GCC diagnostic ignored "-Wextra"
+
+#include "ir/NyaZyOpsEnums.cpp.inc"
+
+#pragma GCC diagnostic pop
+```
+```cmake:src/ir/CMakeLists.txt
+target_sources(NyaZyDialect PRIVATE
+    NyaZyDialect.cpp
+    NyaZyOpsEnums.cpp  # コンパイル対象のソースに忘れずにいれる
+    NyaZyOps.cpp
+    lowerToLLVM.cpp
+)
+```
+また、`NyaZyOps.td`で、`CmpOp::getPredicateByName`の宣言だけしたので、実装を`src/ir/NyaZyOps.cpp`に追加します。`mlir::StringRef`はMLIRが提供している型で文字列をいい感じに扱える型です。
+```cpp:src/ir/NyaZyOps.cpp
+std::optional<CmpPredicate> CmpOp::getPredicateByName(mlir::StringRef name) {
+  if (name == "eq")
+    return CmpPredicate::eq;
+  if (name == "ne")
+    return CmpPredicate::ne;
+  if (name == "lt")
+    return CmpPredicate::lt;
+  if (name == "le")
+    return CmpPredicate::le;
+  if (name == "gt")
+    return CmpPredicate::gt;
+  if (name == "ge")
+    return CmpPredicate::ge;
+
+  return std::nullopt;
+}
+```
+それではいよいよ準備できたので、`src/mlirGen.cpp`に手を加えて、比較演算子のノードからMLIRへの変換部分を実装します。既存の`BinaryExpr`に対するvisitで、比較演算子に対する`case`を追加し、`BinaryOp`に応じて、適切な`CmpPredicate`を作り、`nyacc::CmpOp`を作ります。
+```cpp:src/mlirGen.cpp
+void visit(const nyacc::BinaryExpr &binaryExpr) override {
+  binaryExpr.getLhs()->accept(*this);
+  auto lhs = value_.value();
+  binaryExpr.getRhs()->accept(*this);
+  auto rhs = value_.value();
+
+  switch (binaryExpr.getOp()) {
+  case nyacc::BinaryOp::Add: {
+    value_ =
+        builder_.create<nyacc::AddOp>(builder_.getUnknownLoc(), lhs, rhs);
+    break;
+  }
+  case nyacc::BinaryOp::Sub: {
+    value_ =
+        builder_.create<nyacc::SubOp>(builder_.getUnknownLoc(), lhs, rhs);
+    break;
+  }
+  case nyacc::BinaryOp::Mul: {
+    value_ =
+        builder_.create<nyacc::MulOp>(builder_.getUnknownLoc(), lhs, rhs);
+    break;
+  }
+  case nyacc::BinaryOp::Div: {
+    value_ =
+        builder_.create<nyacc::DivOp>(builder_.getUnknownLoc(), lhs, rhs);
+    break;
+  }
+  case nyacc::BinaryOp::Eq:
+  case nyacc::BinaryOp::Gte:
+  case nyacc::BinaryOp::Gt:
+  case nyacc::BinaryOp::Lte:
+  case nyacc::BinaryOp::Lt: {
+    nyacc::CmpPredicate pred;
+    switch (binaryExpr.getOp()) {
+    case nyacc::BinaryOp::Eq:
+      pred = nyacc::CmpPredicate::eq;
+      break;
+    case nyacc::BinaryOp::Gte:
+      pred = nyacc::CmpPredicate::ge;
+      break;
+    case nyacc::BinaryOp::Gt:
+      pred = nyacc::CmpPredicate::gt;
+      break;
+    case nyacc::BinaryOp::Lte:
+      pred = nyacc::CmpPredicate::le;
+      break;
+    case nyacc::BinaryOp::Lt:
+      pred = nyacc::CmpPredicate::lt;
+      break;
+    default:
+      std::cerr << "Unknown Comparison Operator\n";
+      std::abort();
+    }
+
+    value_ = builder_.create<nyacc::CmpOp>(builder_.getUnknownLoc(), pred,
+                                            lhs, rhs);
+  }
+  }
+}
+```
+それではこの段階で実行してみます。しっかり`nyazy.cmp eq`などというように変換されているのがわかります。`EnumAttr`を使ったので、テキストフォーマットにしたときに、自動的に名前で表示されていていい感じです。
+```bash
+$ ./bin build
+$ ./bin nyacc
+Source code:
+  -2 == 4
+...
+MLIR:
+module {
+  nyazy.func @main() {
+    %0 = nyazy.constant 2 : i64
+    %1 = "nyazy.neg"(%0) : (i64) -> i64
+    %2 = nyazy.constant 4 : i64
+    %3 = nyazy.cmp eq, %1, %2 : i64 vs i64
+    "nyazy.return"(%3) : (i1) -> ()
+  }
+}
+```
+
+#### LowerToLLVM: nyazy.cmpをarith.cmpiにLowerする
+これまで通り、`nyazy.cmp`のための変換パターンである、`CmpOpLowering`を`src/ir/lowerToLLVM.cpp`に定義します。ArithDialectの`CmpIOp`では、整数が符号付きかどうかでpredicateが変わるのですが、NyaZyには今のところ符号付き整数しかないので、符号付きの方を使います。
+```cpp:src/ir/lowerToLLVM.cpp
+struct CmpOpLowering : public mlir::OpConversionPattern<nyacc::CmpOp> {
+  CmpOpLowering(mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<nyacc::CmpOp>(ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(nyacc::CmpOp op, nyacc::CmpOp::Adaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+		auto pred = adaptor.getPredicate();
+		mlir::arith::CmpIPredicate arithPred;
+		// TODO: assume signed integer here.
+		switch (pred) {
+		case nyacc::CmpPredicate::eq:
+			arithPred =  mlir::arith::CmpIPredicate::eq;
+			break;
+		case nyacc::CmpPredicate::ne:
+			arithPred =  mlir::arith::CmpIPredicate::ne;
+			break;
+		case nyacc::CmpPredicate::lt:
+			arithPred =  mlir::arith::CmpIPredicate::slt;
+			break;
+		case nyacc::CmpPredicate::le:
+			arithPred =  mlir::arith::CmpIPredicate::sle;
+			break;
+		case nyacc::CmpPredicate::gt:
+			arithPred =  mlir::arith::CmpIPredicate::sgt;
+			break;
+		case nyacc::CmpPredicate::ge:
+			arithPred =  mlir::arith::CmpIPredicate::sge;
+			break;
+		}
+
+		auto loc = op->getLoc();
+		auto arithCmpOp = rewriter.create<mlir::arith::CmpIOp>(loc, arithPred, adaptor.getLhs(), adaptor.getRhs());
+    rewriter.replaceOp(op, arithCmpOp);
+
+    return mlir::success();
+  }
+};
+
+// ...
+  patterns.add<ConstantOpLowering, FuncOpLowering, ReturnOpLowering,
+               AddOpLowering, SubOpLowering, MulOpLowering, DivOpLowering, PosOpLowering, NegOpLowering, CmpOpLowering>(
+// ...
+```
+それでは実行して試してみましょう。
+```bash
+$ ./bin build
+$ ./bin nyacc
+...
+error: 'llvm.return' op mismatching result types
+Failed to lower to LLVM IR
+Error: Command 'nyacc' failed with exit code 1
+```
+エラーになってしまいました。これは、`nyazy.cmp`が`i1`を返しているのにも関わらず、`main`関数の戻り型が`i64`になっているのが原因です。C言語などでは、暗黙的型変換があったりしますが、NyaZyでは、型は明示的に変換する必要があるということにします。これはStep8で実装していきます！
+
+### Step8 型変換を実装する
