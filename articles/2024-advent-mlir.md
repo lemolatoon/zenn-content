@@ -733,6 +733,29 @@ int main() {
     return 0;
 }
 ```
+:::details VSCodeでC++の補完を効かせる
+C++の補完をVSCodeで補完を効かせるとき、自分は[clangd](https://clangd.llvm.org/)を使っています。clangdはLLVMのプロジェクトの一部で、言語のコーディング支援のプログラムのためのプロトコルである、[Language Server Protocol](https://microsoft.github.io/language-server-protocol/)を用いているので、VSCode以外でもLSPをサポートするエディターで使用できます。
+VSCodeの場合は、まずclangdの拡張機能を入れます。このとき、MicrosoftのC/C++拡張機能はdisableにするかuninstallしてください。clangdにコンパイル方法を認識させる方法は複数ありますが、ここでは、`compile_commands.json`を用いています。
+まず、CMakeLists.txtで次のように記述します。
+```cake:CMakeLists.txt
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+```
+これにより、build時に、`build/compile_commands.json`が生成されるようになります。
+次に、VSCodeの設定からこのファイルを読み込ませるようにします。まず、VSCodeは今作業してるディレクトリをワークスペースとして開いておいてください。次に、その開いたディレクトリで`.vscode/settings.json`を作成します。ここには、その開いているディレクトリ限定の設定を記述できます。
+```json:.vscode/settings.json
+{
+    "clangd.arguments": [
+        "--compile-commands-dir=${workspaceFolder}/build",
+        "--clang-tidy",
+        "--enable-config",
+    ]
+}
+```
+`clangd.arguments`を設定することで、`clangd`を起動するときの引数を指定できます。[^clangd-arguments]
+
+[^clangd-arguments]: 引数の詳細は`clangd --help`で確認できます。
+:::
+
 cmakeのbuildには、configureとbuildの二段階からなります。cmakeの設定などをいじった場合のみ、configureからやり直す必要がありますが、基本はbuildのみで大丈夫です。初回はconfigureする必要があります。
 ```bash
 # configure
@@ -5254,6 +5277,15 @@ private:
   PrimitiveType type_;
 };
 ```
+```cpp:src/ast.cpp
+void CastExpr::dump(int level) const {
+  std::cout << std::string(level * 2, ' ') << "CastExpr(\n";
+  expr_->dump(level + 1);
+  std::cout << std::string((level + 1) * 2, ' ') << "->" << &getCastTo()
+            << "\n";
+  std::cout << std::string(level * 2, ' ') << ")\n";
+}
+```
 ```cpp:include/types.h
 #pragma once
 #include <cstddef>
@@ -5301,5 +5333,62 @@ private:
 std::ostream &operator<<(std::ostream &os, const nyacc::Type *type);
 
 ```
-```cpp:src/ast.h
+それでは、`include/parser.h`と`src/parser.cpp`パーサーに手を加えていきます。`include/parser.h`にはよしなに宣言を加えてください。`src/parser.cpp`では、更新したBNFの通り、`parseUnary`と`parsePrimary`の間に、`parsePostfix`が挟まります。
+`parsePostFix`では、まずキャストかどうかを、`expr`の後に、`as`が続くかどうかで判定します。その次に型が来ますが、型はIdentとして受け取ります。Identは、まず`i`から始まることを確認し、その後、数字といて受け取ります。この数字が`bitWidth`になります。たとえば、`i64`なら`bitWidth`は64です。そして、`CastExpr`を`std::make_unique`で作成し、返します。
+```cpp:src/parser.cpp
+std::unique_ptr<ExprASTNode> Parser::parsePostFix() {
+  auto expr = parsePrimary();
+
+  if (!startsWith({Token::TokenKind::As})) {
+    return expr;
+  }
+
+  pos_++;
+
+  const auto typeIdent = tokens_[pos_];
+  if (typeIdent.getKind() != Token::TokenKind::Ident) {
+    std::cerr << "Expected Ident but got "
+              << Token::tokenKindToString(typeIdent.getKind()) << std::endl;
+    std::abort();
+  }
+
+  if (typeIdent.text()[0] != 'i') {
+    std::cerr << "Currently only types started with 'i' is supported but got "
+              << std::string{typeIdent.text()} << std::endl;
+  }
+
+  size_t bitWidth;
+
+  {
+    auto sv = typeIdent.text().substr(1);
+    auto [ptr, ec] =
+        std::from_chars(sv.data(), sv.data() + sv.size(), bitWidth);
+
+    if (ec != std::errc()) {
+      std::cerr << "Parse BitWidth of Type failed" << std::string{sv}
+                << std::endl;
+    }
+  }
+
+  return std::make_unique<CastExpr>(
+      std::move(expr), PrimitiveType{PrimitiveType::Kind::SInt, bitWidth});
+}
 ```
+それではここまでうまくパースできているかを試してみましょう。
+```bash
+$ ./bin nyacc
+Source code:
+  (3 == 3) as i64
+...
+AST:
+ModuleAST
+  CastExpr(
+    BinaryExpr(
+      NumLitExpr(3)
+      ==
+      NumLitExpr(3)
+    )
+    ->Primitive:SInt, 64-bit
+  )
+```
+`CastExpr`うまくパースできていそうです！
