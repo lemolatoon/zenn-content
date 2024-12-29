@@ -5652,9 +5652,559 @@ TEST(SimpleTest, CompareOps) {
 }
 ```
 
-### Step9 パースエラーのハンドリングをする
+### Step9 変数の実装
+[該当コミット](https://github.com/lemolatoon/NyaZy/commit/c3ecc599016ac3eb07c46f603caff8240ba86dc6) [差分プルリクエスト](https://github.com/lemolatoon/NyaZy/pull/10)
+```bash
+$ git checkout c3ecc599016ac3eb07c46f603caff8240ba86dc6
+```
+いよいよ変数の実装をしていきます。変数の宣言は、式(expr)ではなく文(stmt)としてみなしたいので、文法を大幅に拡張します。BNFを以下に示します。`stmt*`はstmtが0個以上続いていることを示しています。また、最後の１つの`expr`はこれまで通り、exit codeを示す値ということにします。`declare`は変数宣言を表しています。`expr-stmt`は式文で、式の最後にセミコロンをつけてstmtにしたものです。また、`expr`たちの一番上に`assign`が追加され、代入文が書けるようになっています。また、`primary`にidentが許容されるようになっており、変数を値として使えるようになっています。
+```
+module   := stmt* expr
+
+stmt     := declare 
+            | expr-stmt
+declare  := 'let' ident '=' expr ';'
+expr-stmt:= expr ';'
+
+expr     := assign
+assign   := compare
+            | compare '=' expr ';'
+compare  := add
+            | add ('==' | '>=' | '>' | '<=' | '<') compare
+add      := mul
+            | mul ('+' | '-') expr
+mul      := unary
+            | unary ('*' | '/') unary
+unary    := postfix
+            | ('+' | '-') postfix
+postfix  := primary
+            | primary 'as' type
+primary  := num-lit | ident | '(' expr ')'
+
+type     := 'i'{int}
+```
+この文法に従った例が以下です。
+```nz:sample.nz
+let a = 5 + 3;  // declare
+a = 4;          // expr-stmt <=> assign ';'
+a + 3           // expr <=> ident '+' num-lit
+```
+それでは、これから導入する文法を紹介したところで、まずは`Lexer`から作っていきます。
+#### Lexerの実装
+まずは、`include/lexer.h`に新しいトークンのために、`TokenKind`に`;`と`let`を増やします。
+```cpp:include/lexer.h
+enum class TokenKind {
+  // ...
+  Semi, // ;
+  Let,  // let
+  Eof,
+};
+
+static const char *tokenKindToString(TokenKind kind) {
+  switch(kind) {
+  // ...
+  case TokenKind::Semi:
+    return "Semi";
+  case TokenKind::Let:
+    return "Let";
+    break;
+  }
+}
+```
+`src/lexer.cpp`にトークナイズのための実装を少し増やします。`token_mapping`と`long_token_mapping`に`;`と`let`を増やします。また、Identのパース時に記号を含まないようにする修正もいれています。`a = 1 + a;`などしたときに、`a`と`;`がそれぞれ別のトークンとしてみなされるようにするためです。
+```cpp:src/lexer.cpp
+tl::expected<std::vector<Token>, ErrorInfo> Lexer::tokenize() {
+  std::vector<Token> tokens;
+
+  while (!atEof()) {
+    // tokenize integer
+    // ...
+    const auto token_mapping = {
+        std::pair<char, Token::TokenKind>{'+', Token::TokenKind::Plus},
+        {'-', Token::TokenKind::Minus},
+        {'*', Token::TokenKind::Star},
+        {'/', Token::TokenKind::Slash},
+        {'(', Token::TokenKind::OpenParen},
+        {')', Token::TokenKind::CloseParen},
+        {'=', Token::TokenKind::Eq},
+        {'>', Token::TokenKind::Gt},
+        {'<', Token::TokenKind::Lt},
+        {';', Token::TokenKind::Semi}, // added !!
+    };
+
+    bool shouldContinue = false;
+    for (const auto &[c, kind] : token_mapping) {
+      if (input_[pos_] == c) {
+        tokens.emplace_back(kind, input_.substr(pos_, 1), currentLocation());
+        advance();
+        shouldContinue = true;
+        break;
+      }
+    }
+    if (shouldContinue) {
+      continue;
+    }
+
+    // token_mappingにあるような記号かどうかを判定する
+    const auto isPanct = [&](char c) -> bool {
+      return std::ranges::any_of(token_mapping,
+                                 [&](auto &pair) { return c == pair.first; });
+    };
+
+    const auto long_token_mapping = {
+        std::pair<std::string_view, Token::TokenKind>{"as",
+                                                      Token::TokenKind::As},
+        {"let", Token::TokenKind::Let}}; // letを追加
+
+    for (const auto &[c, kind] : long_token_mapping) {
+      if (startsWith(c)) {
+        tokens.emplace_back(kind, input_.substr(pos_, c.size()),
+                            currentLocation());
+        advanceN(c.size());
+        shouldContinue = true;
+        break;
+      }
+    }
+    if (shouldContinue) {
+      continue;
+    }
+
+    // Identをパースするときに記号を含めないように修正
+    if (!atEof() && !startsWithSpace(true) && !isPanct(input_[pos_])) {
+      const size_t startPos = pos_;
+      advance();
+      while (!atEof() && !startsWithSpace(true) && !isPanct(input_[pos_])) {
+        advance();
+      }
+      tokens.emplace_back(Token::TokenKind::Ident,
+                          input_.substr(startPos, pos_ - startPos),
+                          currentLocation());
+      continue;
+    }
+
+    std::string error_msg;
+    std::ostringstream oss;
+    oss << "Unexpected character: " << input_[pos_];
+    error_msg = oss.str();
+    ErrorInfo info{.message = error_msg, .location = currentLocation()};
+    return tl::unexpected{info};
+  }
+  tokens.emplace_back(Token::TokenKind::Eof, "", currentLocation());
+
+  return tokens;
+}
+
+} // namespace nyacc
+```
+では実際にLexerを試してみます。
+```bash
+$ ./bin build
+$ ./bin nyacc
+Source code:
+  let a = 8;
+  a = 4 + a;
+  a
+Tokens:
+Token(Let, let)
+Token(Ident, a)
+Token(Eq, =)
+Token(NumLit, 8)
+Token(Semi, ;)
+Token(Ident, a)
+Token(Eq, =)
+Token(NumLit, 4)
+Token(Plus, +)
+Token(Ident, a)
+Token(Semi, ;)
+Token(Ident, a)
+Token(Eof, )
+```
+`let`も`;`も正しくトークナイズされていそうです。`a;`というパターンでも正しくトークン分けされています。
+
+#### Parserの実装
+
+この書き方は賛否あるかもしれませんが、ここから`include/expr.h`に少し型エイリアスを定義します。ファイル名も今振り返ると微妙なので、`alias.h`などにしてもいいですし、そもそも作る必要もないかもしれません。[^alias-why] 後々のために、式を表す型が、`std::shared_ptr<ExprASTNode>`になっています。また、これから文を定義するので、`Stmt`というエイリアスも定義しています。
+
+[^alias-why]: ここでaliasを作ったのは、`std::shared_ptr`を使うべきか、`std::unique_ptr`を使うべきかを迷っていて、毎回renameするのがめんどくさかったからです。
+
+```cpp:include/expr.h
+#include <memory>
+namespace nyacc {
+class ExprASTNode;
+class StmtASTNode;
+using Expr = std::shared_ptr<ExprASTNode>;
+using Stmt = std::shared_ptr<StmtASTNode>;
+} // namespace nyacc
+```
+また、`include/ast.h`に、`VariableExpr`、`AssignExpr`を定義します。また、文のために、`StmtASTNode`、`DeclareStmt`、`ExprStmt`も定義します。
+```cpp:include/ast.h
+#pragma once
+
+#include "expr.h"
+#include "scope.h"
+#include "types.h"
+#include <cstdint>
+#include <vector>
+
+namespace nyacc {
+class Visitor {
+public:
+  virtual ~Visitor() = default;
+  virtual void visit(const class ModuleAST &node) = 0;
+  virtual void visit(const class DeclareStmt &node) = 0;  // new visit
+  virtual void visit(const class ExprStmt &node) = 0;     // new visit
+  virtual void visit(const class NumLitExpr &node) = 0;
+  virtual void visit(const class BinaryExpr &node) = 0;
+  virtual void visit(const class CastExpr &node) = 0;
+  virtual void visit(const class UnaryExpr &node) = 0;
+  virtual void visit(const class VariableExpr &node) = 0; // new visit
+  virtual void visit(const class AssignExpr &node) = 0;   // new visit
+};
+// ...
+class AssignExpr : public ExprASTNode {
+public:
+  AssignExpr(Expr lhs, Expr rhs)
+      : ExprASTNode(ExprKind::Assign), lhs_(std::move(lhs)),
+        rhs_(std::move(rhs)) {}
+  void accept(Visitor &v) override { v.visit(*this); }
+
+  static bool classof(const ExprASTNode *node) {
+    return node->getKind() == ExprKind::Assign;
+  }
+
+  void dump(int level) const override;
+  const Expr &getLhs() const { return lhs_; }
+  const Expr &getRhs() const { return rhs_; }
+
+private:
+  Expr lhs_;
+  Expr rhs_;
+};
+
+class VariableExpr : public ExprASTNode {
+public:
+  VariableExpr(std::string name, Expr expr)
+      : ExprASTNode(ExprKind::Variable), name_(std::move(name)),
+        expr_(std::move(expr)) {}
+  void accept(Visitor &v) override { v.visit(*this); }
+
+  static bool classof(const ExprASTNode *node) {
+    return node->getKind() == ExprKind::Variable;
+  }
+
+  void dump(int level) const override;
+  const Expr &getExpr() const { return expr_; }
+  const std::string &getName() const { return name_; }
+
+private:
+  std::string name_;
+  Expr expr_;
+};
+
+class StmtASTNode {
+public:
+  enum class StmtKind {
+    Declare,
+    Expr,
+  };
+  explicit StmtASTNode(StmtKind kind) : kind_(kind) {}
+  virtual ~StmtASTNode() = default;
+  virtual void accept(class Visitor &v) = 0;
+  virtual void dump(int level) const = 0;
+  StmtKind getKind() const { return kind_; };
+
+private:
+  StmtKind kind_;
+};
+
+class DeclareStmt : public StmtASTNode {
+public:
+  DeclareStmt(std::string name, Expr expr)
+      : StmtASTNode(StmtKind::Declare), name_(std::move(name)),
+        expr_(std::move(expr)) {}
+  static bool classof(const StmtASTNode *node) {
+    return node->getKind() == StmtKind::Declare;
+  }
+
+  void dump(int level) const override;
+  void accept(Visitor &v) override { v.visit(*this); }
+  const Expr &getInitExpr() const { return expr_; }
+  const std::string &getName() const { return name_; }
+
+private:
+  std::string name_;
+  Expr expr_;
+};
+
+class ExprStmt : public StmtASTNode {
+public:
+  ExprStmt(Expr expr) : StmtASTNode(StmtKind::Expr), expr_(std::move(expr)) {}
+  static bool classof(const StmtASTNode *node) {
+    return node->getKind() == StmtKind::Expr;
+  }
+
+  void dump(int level) const override;
+  void accept(Visitor &v) override { v.visit(*this); }
+  const Expr &getExpr() const { return expr_; }
+
+private:
+  Expr expr_;
+};
+
+class ModuleAST {
+public:
+  ModuleAST(std::vector<Stmt> stmts, Expr expr)
+      : stmts_(std::move(stmts)), expr_(expr) {}
+  void accept(Visitor &v) const { v.visit(*this); };
+  void dump(int level = 0) const;
+  const std::vector<Stmt> &getStmts() const { return stmts_; }
+  const Expr &getExpr() const { return expr_; }
+
+private:
+  std::vector<Stmt> stmts_;
+  Expr expr_;
+};
+
+} // namespace nyacc
+```
+まず、`VariableExpr`には、変数の名前と対応する式を持たせます。`AssignExpr`には、左辺と右辺の式を持たせます。
+```cpp
+class AssignExpr : public ExprASTNode {
+public:
+  AssignExpr(Expr lhs, Expr rhs)
+      : ExprASTNode(ExprKind::Assign), lhs_(std::move(lhs)),
+        rhs_(std::move(rhs)) {}
+  void accept(Visitor &v) override { v.visit(*this); }
+
+  static bool classof(const ExprASTNode *node) {
+    return node->getKind() == ExprKind::Assign;
+  }
+
+  void dump(int level) const override;
+  const Expr &getLhs() const { return lhs_; }
+  const Expr &getRhs() const { return rhs_; }
+
+private:
+  Expr lhs_;
+  Expr rhs_;
+};
+
+class VariableExpr : public ExprASTNode {
+public:
+  VariableExpr(std::string name, Expr expr)
+      : ExprASTNode(ExprKind::Variable), name_(std::move(name)),
+        expr_(std::move(expr)) {}
+  void accept(Visitor &v) override { v.visit(*this); }
+
+  static bool classof(const ExprASTNode *node) {
+    return node->getKind() == ExprKind::Variable;
+  }
+
+  void dump(int level) const override;
+  const Expr &getExpr() const { return expr_; }
+  const std::string &getName() const { return name_; }
+
+private:
+  std::string name_;
+  Expr expr_;
+};
+```
+また、`StmtASTNode`は、文を表すクラスのベースクラスとなるクラスです。[LLVM-style RTTI](https://llvm.org/docs/HowToSetUpLLVMStyleRTTI.html)を使うために、`StmtKind`を自身に持たせ、これはコンストラクタから初期化されるようにします。`Stmt`に対しても、visitorパターンを適用したいので、式と同様に`accept`を定義して、派生クラスでoverrideしてもらうことにします。
+```cpp
+class StmtASTNode {
+public:
+  enum class StmtKind {
+    Declare,
+    Expr,
+  };
+  explicit StmtASTNode(StmtKind kind) : kind_(kind) {}
+  virtual ~StmtASTNode() = default;
+  virtual void accept(class Visitor &v) = 0;
+  virtual void dump(int level) const = 0;
+  StmtKind getKind() const { return kind_; };
+
+private:
+  StmtKind kind_;
+};
+```
+次に、変数宣言を表す式である`DeclareStmt`を定義します。これは変数名と初期化を持ちます。`ExprStmt`は式に`;`をつけて文にしたものです。式を1つ持ちます。
+```cpp
+class DeclareStmt : public StmtASTNode {
+public:
+  DeclareStmt(std::string name, Expr expr)
+      : StmtASTNode(StmtKind::Declare), name_(std::move(name)),
+        expr_(std::move(expr)) {}
+  static bool classof(const StmtASTNode *node) {
+    return node->getKind() == StmtKind::Declare;
+  }
+
+  void dump(int level) const override;
+  void accept(Visitor &v) override { v.visit(*this); }
+  const Expr &getInitExpr() const { return expr_; }
+  const std::string &getName() const { return name_; }
+
+private:
+  std::string name_;
+  Expr expr_;
+};
+
+class ExprStmt : public StmtASTNode {
+public:
+  ExprStmt(Expr expr) : StmtASTNode(StmtKind::Expr), expr_(std::move(expr)) {}
+  static bool classof(const StmtASTNode *node) {
+    return node->getKind() == StmtKind::Expr;
+  }
+
+  void dump(int level) const override;
+  void accept(Visitor &v) override { v.visit(*this); }
+  const Expr &getExpr() const { return expr_; }
+
+private:
+  Expr expr_;
+};
+```
+また、プログラム全体を表す`ModuleAST`も少し変更するようにします。可変長個の`stmt`と、exit codeを表す１つの`expr`を持たせます。
+```cpp
+class ModuleAST {
+public:
+  ModuleAST(std::vector<Stmt> stmts, Expr expr)
+      : stmts_(std::move(stmts)), expr_(expr) {}
+  void accept(Visitor &v) const { v.visit(*this); };
+  void dump(int level = 0) const;
+  const std::vector<Stmt> &getStmts() const { return stmts_; }
+  const Expr &getExpr() const { return expr_; }
+
+private:
+  std::vector<Stmt> stmts_;
+  Expr expr_;
+};
+```
+現時点では、変数は、ある時点のある式を指していることにします。この実装だと、ループで複数回代入などはできませんが、パース時にいま各変数が何をどのexprを指しているのかを管理して、`assign`のたびにそれを変更すれば代入のようなものが実現できます。Rustが分かる方向けに言えば、`let mut`で宣言するのではなく、毎回`let`で宣言してシャドーイングしているような感じです。
+
+### Step10 パースエラーのハンドリングをする
 [該当コミット](https://github.com/lemolatoon/NyaZy/commit/af782003d7f02d653068a12b83d06535a56d78a4) [差分プルリクエスト](https://github.com/lemolatoon/NyaZy/pull/14)
 ```bash
 $ git checkout af782003d7f02d653068a12b83d06535a56d78a4
 ```
-Step5で`Lexer::tokenize`をエラー対応しましたが、このStepでは`Parser::parseModule`、`MLIRGen::gen`でも、`tl::expected`を返してエラーハンドリングするようにします。
+Step5で`Lexer::tokenize`をエラー対応しましたが、このStepでは`Parser::parseModule`、`MLIRGen::gen`でも、`tl::expected`を返してエラーハンドリングするようにします。`error.h`には、
+```cpp:include/error.h
+#pragma once
+#include "tl/expected.hpp"
+#include <iostream>
+#include <memory>
+#include <ostream>
+#include <sstream>
+#include <string>
+
+namespace nyacc {
+
+// Definition of `Location` and `ErrorInfo`
+
+template <typename T> using Result = tl::expected<T, ErrorInfo>;
+
+/// Helper class to build an ErrorInfo with location and message
+class ErrorBuilder {
+public:
+  ErrorBuilder(const Location invoked_loc, const Location error_loc)
+      : invoked_loc_(invoked_loc), error_loc_(error_loc), oss_() {
+    oss_ << "@" << *invoked_loc_.file << ":" << invoked_loc_.line << ":"
+         << invoked_loc_.col << "\n";
+  }
+
+  template <typename T> ErrorBuilder &operator<<(const T &value) {
+    oss_ << value;
+    return *this;
+  }
+
+  operator tl::unexpected<ErrorInfo>() const {
+    return tl::unexpected<ErrorInfo>(ErrorInfo{oss_.str(), error_loc_});
+  }
+
+private:
+  Location invoked_loc_;
+  Location error_loc_;
+  mutable std::ostringstream oss_;
+};
+
+template <typename... Args>
+tl::unexpected<ErrorInfo> make_error(Location invoke_loc, Location file_loc,
+                                     Args &&...args) {
+  ErrorBuilder eb{invoke_loc, file_loc};
+  if constexpr (sizeof...(args) > 0) {
+    (eb << ... << args);
+  }
+  return tl::unexpected<ErrorInfo>{eb};
+}
+
+} // namespace nyacc
+
+#define FATAL(...)                                                             \
+  nyacc::make_error(                                                           \
+      nyacc::Location{std::make_shared<std::string>(__FILE__), __LINE__, 0},   \
+      __VA_ARGS__)
+
+#define EXPECT_EQ(loc, val1, val2)                                             \
+  do {                                                                         \
+    if ((val1) != (val2)) {                                                    \
+      return FATAL(loc, "Expected:\n  ", #val1 " == " #val2, "\nActual:\n  ",  \
+                   (val1), " != ", (val2), "\n");                              \
+    }                                                                          \
+  } while (0)
+
+#define EXPECT_NE(loc, val1, val2)                                             \
+  do {                                                                         \
+    if ((val1) == (val2)) {                                                    \
+      return FATAL(loc, "Expected:\n  ", #val1 " != " #val2, "\nActual:\n  ",  \
+                   (val1), " == ", (val2), "\n");                              \
+    }                                                                          \
+  } while (0)
+
+#define EXPECT_LT(loc, val1, val2)                                             \
+  do {                                                                         \
+    if (!((val1) < (val2))) {                                                  \
+      return FATAL(loc, "Expected:\n  ", #val1 " < " #val2, "\nActual:\n  ",   \
+                   (val1), " >= ", (val2), "\n");                              \
+    }                                                                          \
+  } while (0)
+
+#define EXPECT_LE(loc, val1, val2)                                             \
+  do {                                                                         \
+    if (!((val1) <= (val2))) {                                                 \
+      return FATAL(loc, "Expected:\n  ", #val1 " <= " #val2, "\nActual:\n  ",  \
+                   (val1), " > ", (val2), "\n");                               \
+    }                                                                          \
+  } while (0)
+
+#define EXPECT_GT(loc, val1, val2)                                             \
+  do {                                                                         \
+    if (!((val1) > (val2))) {                                                  \
+      return FATAL(loc, "Expected:\n  ", #val1 " > " #val2, "\nActual:\n  ",   \
+                   (val1), " <= ", (val2), "\n");                              \
+    }                                                                          \
+  } while (0)
+
+#define EXPECT_GE(loc, val1, val2)                                             \
+  do {                                                                         \
+    if (!((val1) >= (val2))) {                                                 \
+      return FATAL(loc, "Expected:\n  ", #val1 " >= " #val2, "\nActual:\n  ",  \
+                   (val1), " < ", (val2), "\n");                               \
+    }                                                                          \
+  } while (0)
+
+#define EXPECT_TRUE(loc, condition)                                            \
+  do {                                                                         \
+    if (!(condition)) {                                                        \
+      return FATAL(loc, "Expected:\n  ", #condition " to be true",             \
+                   "\nActual:\n  ", #condition " is false\n");                 \
+    }                                                                          \
+  } while (0)
+
+#define EXPECT_FALSE(loc, condition)                                           \
+  do {                                                                         \
+    if (condition) {                                                           \
+      return FATAL(loc, "Expected:\n  ", #condition " to be false",            \
+                   "\nActual:\n  ", #condition " is true\n");                  \
+    }                                                                          \
+  } while (0)
+
+```
