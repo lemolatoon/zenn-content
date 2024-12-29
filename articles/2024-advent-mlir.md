@@ -5392,3 +5392,262 @@ ModuleAST
   )
 ```
 `CastExpr`うまくパースできていそうです！
+
+#### NyaZyDialectにCastOpを追加
+それでは、これまでと同じ流れで、`nyazy.cast`を追加します。
+```td:include/ir/NyaZyOps.td
+#ifndef NYAZY_OPS
+#define NYAZY_OPS
+
+//===----------------------------------------------------------------------===//
+// CastOp
+//===----------------------------------------------------------------------===//
+def CastOp : NyaZyOp<"cast", 
+    [Pure,
+     DeclareOpInterfaceMethods<CastOpInterface>
+     ]> {
+  let summary = "type cast operation";
+  let description = [{
+    The "cast" operation converts an input value from one primitive type to an another primitive type. This corresponds to the NyaZy's "as $type" expression.
+  }];
+  let arguments = (ins AnyType:$in);
+  let results = (outs AnyType:$out);
+  let assemblyFormat = "$in attr-dict `:` type($in) `to` type($out)";
+}
+
+#endif // NYAZY_OPS
+```
+`src/mlirGen.cpp`で、`CastExpr`の変換も実装します。まず、`mlir::Type asMLIRType(mlir::MLIRContext*, {Type,PrimitiveType})`を追加し、AST上の型から、MLIRの型へ簡単に変換できるようにします。`include/mlirGen.h`で`mlir::MLIRContext`などを前方宣言してることに注意です。`CastExpr`のvisitでは、`getCastTo`でキャスト先の型を取得して、それを`asMLIRGen`でMLIRの型にして、`CastOp`を作成して`value_`に入れます。
+```cpp:include/mlirGen.h
+#pragma once
+#include "types.h"
+#include <mlir/IR/Types.h>
+
+namespace mlir {
+template <class OpT> class OwningOpRef;
+class ModuleOp;
+class MLIRContext;
+} // namespace mlir
+
+namespace nyacc {
+mlir::Type asMLIRType(mlir::MLIRContext *ctx, Type type);
+mlir::Type asMLIRType(mlir::MLIRContext *ctx, PrimitiveType type);
+// ...
+} // namespace nyacc
+```
+```cpp:src/mlirGen.cpp
+#include "mlirGen.h"
+#include "ast.h"
+#include "ir/NyaZyDialect.h"
+#include "ir/NyaZyOps.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include <iostream>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/IR/BuiltinTypes.h>
+
+namespace nyacc {
+mlir::Type asMLIRType(mlir::MLIRContext *ctx, Type type) {
+  switch (type.getKind()) {
+  case Type::TypeKind::Primitive:
+    return asMLIRType(ctx, llvm::cast<PrimitiveType>(type));
+  }
+}
+
+mlir::Type asMLIRType(mlir::MLIRContext *ctx, PrimitiveType type) {
+  switch (type.getPrimitiveKind()) {
+  case PrimitiveType::Kind::SInt:
+    return mlir::IntegerType::get(ctx, type.getBitWidth());
+  }
+}
+
+} // namespace nyacc
+// ...
+void visit(const nyacc::CastExpr &castExpr) override {
+  castExpr.getExpr()->accept(*this);
+  auto expr = value_.value();
+  mlir::Type out =
+      nyacc::asMLIRType(builder_.getContext(), castExpr.getCastTo());
+  value_ =
+      builder_.create<nyacc::CastOp>(builder_.getUnknownLoc(), out, expr);
+}
+```
+では実行して試してみます。
+```bash
+$ ./bin nyacc
+Source code:
+  (3 == 3) as i64
+...
+module {
+  nyazy.func @main() {
+    %0 = nyazy.constant 3 : i64
+    %1 = nyazy.constant 3 : i64
+    %2 = nyazy.cmp eq, %0, %1 : i64 vs i64
+    %3 = nyazy.cast %2 : i1 to i64
+    "nyazy.return"(%3) : (i64) -> ()
+  }
+}
+```
+`nyazy.cast`にうまく変換されています。
+
+#### CastOpLoweringを実装する
+`nyazy.cast`はこれまでの単にArith Dialectにマッピングしていたのとは異なり、少しだけ複雑になります。まずはbit長が減るのか増えるのかによって[arith.extsi](https://mlir.llvm.org/docs/Dialects/ArithOps/#arithextsi-arithextsiop)に変換するのか、[arith.trunci](https://mlir.llvm.org/docs/Dialects/ArithOps/#arithtrunci-arithtrunciop)に変換するのかが異なります。では以下に`CastOpLowering`の実装を示します。`getOrIntBitWidth`でその型のbit長が分かるので、それによってextendするかtruncするかを決めます。`patterns.add`に足すことも忘れないでください。
+```cpp:src/ir/lowerToLLVM.cpp
+struct CastOpLowering : public mlir::OpConversionPattern<nyacc::CastOp> {
+  CastOpLowering(mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<nyacc::CastOp>(ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(nyacc::CastOp op, nyacc::CastOp::Adaptor adaptor [[maybe_unused]],
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto fromT = op.getIn().getType();
+    auto toT = op.getType();
+    auto loc = op->getLoc();
+    if (fromT == toT) {
+      rewriter.replaceOp(op, op.getIn());
+      return mlir::success();
+    }
+    const auto int2intExt = [&](mlir::Value from, mlir::IntegerType intType) -> mlir::Value {
+      assert(from.getType().getIntOrFloatBitWidth() < intType.getIntOrFloatBitWidth());
+      return rewriter.create<mlir::arith::ExtUIOp>(loc, intType, from);
+    };
+
+    const auto int2intTrunc = [&](mlir::Value from, mlir::IntegerType intType) -> mlir::Value {
+      assert(from.getType().getIntOrFloatBitWidth() > intType.getIntOrFloatBitWidth());
+      return rewriter.create<mlir::arith::TruncIOp>(loc, intType, from);
+    };
+
+    auto value = op.getIn();
+    const mlir::IntegerType intToT = llvm::cast<mlir::IntegerType>(toT);
+    if (fromT.getIntOrFloatBitWidth() > toT.getIntOrFloatBitWidth()) {
+      // truncate
+      value = int2intTrunc(value, intToT);
+    } else {
+      // extend
+      value = int2intExt(value, intToT);
+    }
+
+    rewriter.replaceOp(op, value);
+
+    return mlir::success();
+  }
+};
+```
+:::details より一般的なCastOpLowering
+なぜか実装時、一般的なCastOpLoweringを実装してしまったので、それをここに置いておきます。将来的に浮動小数をサポートしたときに、`nyazy.cast`で、浮動小数と整数との間の変換もできるようになっています。
+```cpp
+struct CastOpLowering : public mlir::OpConversionPattern<nyacc::CastOp> {
+  CastOpLowering(mlir::MLIRContext *ctx)
+      : mlir::OpConversionPattern<nyacc::CastOp>(ctx) {}
+
+  mlir::LogicalResult
+  matchAndRewrite(nyacc::CastOp op, nyacc::CastOp::Adaptor adaptor [[maybe_unused]],
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto fromT = op.getIn().getType();
+    auto toT = op.getType();
+    auto loc = op->getLoc();
+    if (fromT == toT) {
+      rewriter.replaceOp(op, op.getIn());
+      return mlir::success();
+    }
+
+    const auto int2fp = [&](mlir::Value from, mlir::FloatType floatType) -> mlir::Value {
+      assert(from.getType().isInteger());
+      if (from.getType().isUnsignedInteger()) {
+        return rewriter.create<mlir::arith::UIToFPOp>(loc, floatType, from);
+      } else {
+        return rewriter.create<mlir::arith::SIToFPOp>(loc, floatType, from);
+      }
+    };
+    
+    const auto fp2int = [&](mlir::Value from, mlir::IntegerType intType) -> mlir::Value {
+      assert(from.getType().isIntOrFloat() && !from.getType().isInteger());
+      if (from.getType().isUnsignedInteger()) {
+        return rewriter.create<mlir::arith::FPToUIOp>(loc, intType, from);
+      } else {
+        return rewriter.create<mlir::arith::FPToSIOp>(loc, intType, from);
+      }
+    };
+
+    const auto int2intExt = [&](mlir::Value from, mlir::IntegerType intType) -> mlir::Value {
+      assert(from.getType().getIntOrFloatBitWidth() < intType.getIntOrFloatBitWidth());
+      if (from.getType().isUnsignedInteger()) {
+        return rewriter.create<mlir::arith::ExtUIOp>(loc, intType, from);
+      } else {
+        return rewriter.create<mlir::arith::ExtSIOp>(loc, intType, from);
+      }
+    };
+
+    const auto int2intTrunc = [&](mlir::Value from, mlir::IntegerType intType) -> mlir::Value {
+      assert(from.getType().getIntOrFloatBitWidth() > intType.getIntOrFloatBitWidth());
+      return rewriter.create<mlir::arith::TruncIOp>(loc, intType, from);
+    };
+
+    auto value = op.getIn();
+    if (toT.isInteger()) {
+      const mlir::IntegerType intToT = llvm::cast<mlir::IntegerType>(toT);
+      if (!fromT.isInteger()) {
+        value = fp2int(value, intToT);
+      } else {
+        // int to int
+        if (fromT.getIntOrFloatBitWidth() > toT.getIntOrFloatBitWidth()) {
+          // truncate
+          value = int2intTrunc(value, intToT);
+        } else {
+          // extend
+          value = int2intExt(value, intToT);
+        }
+      }
+    } else {
+      value = int2fp(value, llvm::cast<mlir::FloatType>(toT));
+    }
+
+    rewriter.replaceOp(op, value);
+
+    return mlir::success();
+  }
+};
+```
+:::
+
+結局Arith Dialectに変換しているので、あとは、LLVM Dialectまで落ちるはずです。それでは実行して試してみます。
+```bash
+$ ./bin nyacc
+Source code:
+  (3 == 3) as i64
+...
+Lowered MLIR:
+module {
+  llvm.func @main() -> i64 {
+    %0 = llvm.mlir.constant(3 : i64) : i64
+    %1 = llvm.mlir.constant(3 : i64) : i64
+    %2 = llvm.mlir.constant(true) : i1
+    %3 = llvm.bitcast %2 : i1 to i1
+    %4 = llvm.zext %3 : i1 to i64
+    llvm.return %4 : i64
+  }
+}
+Generated LLVM IR:
+; ModuleID = 'LLVMDialectModule'
+source_filename = "LLVMDialectModule"
+
+define i64 @main() {
+  ret i64 1
+}
+$ ./bin lli output.ll
+$ ehoc $? # fishなら `echo $status`
+1
+```
+うまくいっていそうです。テストも追加します。テストが通ることを確認してください！
+```cpp:simpleTest.cpp
+TEST(SimpleTest, CompareOps) {
+  EXPECT_EQ(1, runNyaZy("(3 == 3) as i64"));
+
+  EXPECT_EQ(1, runNyaZy("(3 >= -3) as i64"));
+  EXPECT_EQ(1, runNyaZy("(3 > -3) as i64"));
+
+  EXPECT_EQ(0, runNyaZy("(3 <= -3) as i64"));
+  EXPECT_EQ(0, runNyaZy("(3 < -3) as i64"));
+}
+```
