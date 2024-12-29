@@ -5651,3 +5651,10 @@ TEST(SimpleTest, CompareOps) {
   EXPECT_EQ(0, runNyaZy("(3 < -3) as i64"));
 }
 ```
+
+### Step9 パースエラーのハンドリングをする
+[該当コミット](https://github.com/lemolatoon/NyaZy/commit/af782003d7f02d653068a12b83d06535a56d78a4) [差分プルリクエスト](https://github.com/lemolatoon/NyaZy/pull/14)
+```bash
+$ git checkout af782003d7f02d653068a12b83d06535a56d78a4
+```
+Step5で`Lexer::tokenize`をエラー対応しましたが、このStepでは`Parser::parseModule`、`MLIRGen::gen`でも、`tl::expected`を返してエラーハンドリングするようにします。
