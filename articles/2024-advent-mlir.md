@@ -6080,6 +6080,108 @@ private:
 };
 ```
 現時点では、変数は、ある時点のある式を指していることにします。この実装だと、ループで複数回代入などはできませんが、パース時にいま各変数が何をどのexprを指しているのかを管理して、`assign`のたびにそれを変更すれば代入のようなものが実現できます。Rustが分かる方向けに言えば、`let mut`で宣言するのではなく、毎回`let`で宣言してシャドーイングしているような感じです。
+AST全体の構造が分かりにくいと思うので、先にASTのdumpの例を示します。`VariableExpr`の`->`の後には、その変数が指し示している式が書いてあります。`Expr`が`std::unique_ptr`ではなくて`std::shared_ptr`にした理由です。ここはパース中によしなに指し示す式をトラックしてやる必要があります。
+```bash
+Source code:
+  let a = 8;
+  a = 4 + a;
+  a
+AST:
+ModuleAST
+  DeclareStmt(a = 
+    NumLitExpr(8)
+  ) // let a = 8;
+  ExprStmt(
+    AssignExpr(
+      VariableExpr(a) -> 
+        NumLitExpr(8) // a の内容
+      =
+      BinaryExpr(
+        NumLitExpr(4)
+        +
+        VariableExpr(a) -> 
+          NumLitExpr(8)
+      )
+    )
+  ) // a = 4 + a;
+Expr:
+  VariableExpr(a) -> 
+    BinaryExpr(
+      NumLitExpr(4)
+      +
+      VariableExpr(a) -> 
+        NumLitExpr(8)
+    ) // a の内容が書き換えられている！
+```
+それでは、実際Parserを実装しましょう！、、、と言いたいのですが、スコープを定義するために、`class Scope`を定義します。`Scope`はネストさせることを想定していて、`parent_`は親スコープを表していて、ルートスコープ（グローバルスコープ）である場合は、`std::nullopt`にします。`ident_map_`はそのスコープでの変数名から式へのマッピングを保持しています。`lookup`では、変数名からスコープから親スコープまで検索し、見つかった式を返します。`insert`では、そのスコープでの式を更新します。また、コンストラクタは2種類あり、引数を何も取らない場合は、ルートスコープを作り、スコープを渡したときは、そのスコープを親スコープとして子スコープを作ります。実装上の便利関数として、`localLookup`も宣言しています。今の現在の段階でのスコープから変数名で検索して式を返します。
+```cpp:include/scope.h
+#pragma once
+
+#include "expr.h"
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+
+namespace nyacc {
+class Scope {
+public:
+  /// Constructor for the global scope
+  explicit Scope() : parent_(std::nullopt), ident_map_() {}
+
+  explicit Scope(std::shared_ptr<Scope> parent)
+      : parent_(std::move(parent)), ident_map_() {}
+
+  std::optional<Expr> lookup(const std::string &name);
+  void insert(std::string name, Expr expr);
+
+private:
+  std::optional<Expr> localLookup(const std::string &name);
+
+  std::optional<std::shared_ptr<Scope>> parent_;
+  std::unordered_map<std::string, Expr> ident_map_;
+};
+} // namespace nyacc
+```
+では、実施に`Scope`の実装を`src/scope.cpp`にしていきます。`localLookup`は、そのクラスの`ident_map_`から`find`を使って検索します。親クラスには手は触れません。`lookup`では、`localLookup`で検索してから、ない場合は、親スコープから検索します。
+```cpp:src/scope.cpp
+#include "scope.h"
+#include <iostream>
+
+namespace nyacc {
+
+std::optional<Expr> Scope::lookup(const std::string &name) {
+  if (auto v = localLookup(name)) {
+    return *v;
+  }
+
+  if (parent_) {
+    return parent_.value()->lookup(name);
+  }
+
+  return std::nullopt;
+}
+
+void Scope::insert(std::string name, Expr expr) {
+  ident_map_.insert_or_assign(name, expr);
+}
+
+std::optional<Expr> Scope::localLookup(const std::string &name) {
+  auto it = ident_map_.find(name);
+  if (it == ident_map_.end()) {
+    return std::nullopt;
+  }
+
+  return it->second;
+}
+
+} // namespace nyacc
+```
+ようやくここまででスコープが実装できたので、いよいよParserを実装していきます。`include/parser.h`と`include/parser.cpp`を編集します。
+```cpp:include/parser.h
+```
+```cpp:src/parser.cpp
+```
 
 ### Step10 パースエラーのハンドリングをする
 [該当コミット](https://github.com/lemolatoon/NyaZy/commit/af782003d7f02d653068a12b83d06535a56d78a4) [差分プルリクエスト](https://github.com/lemolatoon/NyaZy/pull/14)
