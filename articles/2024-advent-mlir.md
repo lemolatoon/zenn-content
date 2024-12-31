@@ -6458,7 +6458,7 @@ TEST(SimpleTest, Variable) {
 ```bash
 $ git checkout af782003d7f02d653068a12b83d06535a56d78a4
 ```
-Step5で`Lexer::tokenize`をエラー対応しましたが、このStepでは`Parser::parseModule`、`MLIRGen::gen`でも、`tl::expected`を返してエラーハンドリングするようにします。`error.h`には、
+Step5で`Lexer::tokenize`をエラー対応しましたが、このStepでは`Parser::parseModule`、`MLIRGen::gen`でも、`tl::expected`を返してエラーハンドリングするようにします。すなわち、パースとMLIR生成でもエラーハンドリングをするということです。`error.h`には、以下の記述を増やします。
 ```cpp:include/error.h
 #pragma once
 #include "tl/expected.hpp"
@@ -6514,6 +6514,10 @@ tl::unexpected<ErrorInfo> make_error(Location invoke_loc, Location file_loc,
   nyacc::make_error(                                                           \
       nyacc::Location{std::make_shared<std::string>(__FILE__), __LINE__, 0},   \
       __VA_ARGS__)
+```
+まず、`tl::expected<T, E>`の`E`は、どうせ`ErrorInfo`にするので、`Result<T>`という型エイリアスを作成しています。また、エラー時には、実際にC++のソースコード上の行も分かった方が良いので、その情報も含めた`ErrorInfo`を作るための、`make_error`関数を作り、`FATAL`マクロで自動的に`FATAL`を読んだC++上のソースコード位置情報を埋め込むようにしています。`FATAL`の引数は、`make_error`の`Location file_loc`と、エラーメッセージをフォーマットするための変数を渡します。これらは、`<<`でつなぎこまれてエラーメッセージになります。また、この``FATAL`をうまく使うための`EXPECT_EQ`などを定義します。
+
+```cpp:include/error.h
 
 #define EXPECT_EQ(loc, val1, val2)                                             \
   do {                                                                         \
@@ -6580,3 +6584,550 @@ tl::unexpected<ErrorInfo> make_error(Location invoke_loc, Location file_loc,
   } while (0)
 
 ```
+
+まずはこのマクロを使って`src/lexer.cpp`を書き換えます。
+```cpp:src/lexer.cpp
+namespace nyacc {
+Result<std::vector<Token>> Lexer::tokenize() {
+  std::vector<Token> tokens;
+
+  while (!atEof()) {
+    // tokenize all tokens
+    return FATAL(currentLocation(), "Unexpected character: ", input_[pos_]);
+  }
+  tokens.emplace_back(Token::TokenKind::Eof, "", currentLocation());
+
+  return tokens;
+}
+
+} // namespace nyacc
+```
+これで、書き換えができました。かなりシンプルになりました。`include/parser.h`と`src/parser.cpp`も書き換えていきます。まず、すべてのパースの関数の戻り型に`Result`を使うようにします。また、先頭のトークンを見るための`peek()`も宣言します。
+```cpp:include/parser.h
+// ...
+  Result<ModuleAST> parseModule();
+
+private:
+  Result<Stmt> parseDeclare();
+
+  Result<Expr> parseExpr();
+  Result<Expr> parseAssign();
+  Result<Expr> parseCompare();
+  Result<Expr> parseAdd();
+  Result<Expr> parseMul();
+  Result<Expr> parseUnary();
+  Result<Expr> parsePostFix();
+  Result<Expr> parsePrimary();
+
+  const Token &peek() const;
+// ...
+```
+まず、MLIR生成時にもエラーハンドリングするために、`nyacc::Location`を各ASTのノードに持たせるようにします。そして、親クラスのコンストラクタでロケーション情報を受取るようにします。各子クラスのコンストラクタでもロケーション情報を受取るようにし、それは親クラスのコンストラクタにそのまま渡すようにします。
+```cpp:include/ast.h
+class ExprASTNode {
+// ...
+  explicit ExprASTNode(Location loc, ExprKind kind) : kind_(kind), loc_(loc) {}
+  virtual ~ExprASTNode() = default;
+  virtual void accept(class Visitor &v) = 0;
+  virtual void dump(int level) const = 0;
+  ExprKind getKind() const { return kind_; }
+  Location getLoc() const { return loc_; }
+
+private:
+  ExprKind kind_;
+  Location loc_;
+};
+
+class StmtASTNode {
+// ...
+  explicit StmtASTNode(Location loc, StmtKind kind) : kind_(kind), loc_(loc) {}
+  virtual ~StmtASTNode() = default;
+  virtual void accept(class Visitor &v) = 0;
+  virtual void dump(int level) const = 0;
+  StmtKind getKind() const { return kind_; }
+  Location getLoc() const { return loc_; }
+
+private:
+  StmtKind kind_;
+  Location loc_;
+};
+
+class NumLitExpr : public ExprASTNode {
+public:
+  NumLitExpr(Location loc, int64_t value)
+      : ExprASTNode(loc, ExprKind::NumLit), value_(value) {}
+// ...
+};
+// ...
+```
+`src/parser.cpp`では、エラー処理をすべて、定義したマクロを使って行います。いままで、`startsWith`などを使って、特定のトークンが来ることを確かめていたところは、`EXPECT_EQ`を用いて書き換えています。また他の一般のエラーも`FATAL`を用いています。
+```diff cpp:src/parser.cpp
+diff --git a/src/parser.cpp b/src/parser.cpp
+index bad39c5..9dbc0fe 100644
+--- a/src/parser.cpp
++++ b/src/parser.cpp
+@@ -10,6 +10,7 @@
+ namespace nyacc {
+ 
+ Result<ModuleAST> Parser::parseModule() {
++  auto loc = peek().getLoc();
+   std::vector<Stmt> stmts;
+   Expr lastExpr;
+   while (!startsWith({Token::TokenKind::Eof})) {
+@@ -32,12 +33,14 @@ Result<ModuleAST> Parser::parseModule() {
+     }
+     pos_++;
+ 
+-    stmts.emplace_back(std::make_shared<ExprStmt>(std::move(*expr)));
++    stmts.emplace_back(
++        std::make_shared<ExprStmt>((*expr)->getLoc(), std::move(*expr)));
+   }
+-  return ModuleAST(std::move(stmts), std::move(lastExpr));
++  return ModuleAST(loc, std::move(stmts), std::move(lastExpr));
+ }
+ 
+ Result<Stmt> Parser::parseDeclare() {
++  auto loc = peek().getLoc();
+   EXPECT_EQ(peek().getLoc(), peek().getKind(), Token::TokenKind::Let);
+   pos_++;
+ 
+@@ -57,12 +60,13 @@ Result<Stmt> Parser::parseDeclare() {
+   pos_++;
+ 
+   scope_->insert(name, *expr);
+-  return std::make_shared<DeclareStmt>(std::move(name), std::move(*expr));
++  return std::make_shared<DeclareStmt>(loc, std::move(name), std::move(*expr));
+ }
+ 
+ Result<Expr> Parser::parseExpr() { return parseAssign(); }
+ 
+ Result<Expr> Parser::parseAssign() {
++  auto loc = peek().getLoc();
+   auto lhs = parseCompare();
+   if (!lhs) {
+     return lhs;
+@@ -76,13 +80,14 @@ Result<Expr> Parser::parseAssign() {
+     }
+     auto var_expr = llvm::cast<VariableExpr>(lhs->get());
+     scope_->insert(var_expr->getName(), *rhs);
+-    return std::make_shared<AssignExpr>(std::move(*lhs), std::move(*rhs));
++    return std::make_shared<AssignExpr>(loc, std::move(*lhs), std::move(*rhs));
+   }
+ 
+   return lhs;
+ }
+ 
+ Result<Expr> Parser::parseCompare() {
++  auto loc = peek().getLoc();
+   auto lhs = parseAdd();
+   if (!lhs) {
+     return lhs;
+@@ -112,12 +117,14 @@ Result<Expr> Parser::parseCompare() {
+     if (!rhs) {
+       return rhs;
+     }
+-    lhs = std::make_shared<BinaryExpr>(std::move(*lhs), std::move(*rhs), op);
++    lhs =
++        std::make_shared<BinaryExpr>(loc, std::move(*lhs), std::move(*rhs), op);
+     continue;
+   }
+ }
+ 
+ Result<Expr> Parser::parseAdd() {
++  auto loc = peek().getLoc();
+   auto node = parseMul();
+   if (!node) {
+     return node;
+@@ -135,8 +142,8 @@ Result<Expr> Parser::parseAdd() {
+       }
+       BinaryOp op = token.getKind() == Token::TokenKind::Plus ? BinaryOp::Add
+                                                               : BinaryOp::Sub;
+-      node =
+-          std::make_shared<BinaryExpr>(std::move(*node), std::move(*rhs), op);
++      node = std::make_shared<BinaryExpr>(loc, std::move(*node),
++                                          std::move(*rhs), op);
+       continue;
+     }
+     default:
+@@ -146,6 +153,7 @@ Result<Expr> Parser::parseAdd() {
+ }
+ 
+ Result<Expr> Parser::parseMul() {
++  auto loc = peek().getLoc();
+   auto node = parseUnary();
+   if (!node) {
+     return node;
+@@ -162,8 +170,8 @@ Result<Expr> Parser::parseMul() {
+       }
+       BinaryOp op = token.getKind() == Token::TokenKind::Star ? BinaryOp::Mul
+                                                               : BinaryOp::Div;
+-      node =
+-          std::make_shared<BinaryExpr>(std::move(*node), std::move(*rhs), op);
++      node = std::make_shared<BinaryExpr>(loc, std::move(*node),
++                                          std::move(*rhs), op);
+       continue;
+     }
+     default:
+@@ -173,7 +181,8 @@ Result<Expr> Parser::parseMul() {
+ }
+ 
+ Result<Expr> Parser::parseUnary() {
+-  const auto &token = tokens_[pos_];
++  const auto &token = peek();
++  auto loc = token.getLoc();
+ 
+   switch (token.getKind()) {
+   case Token::TokenKind::Plus:
+@@ -185,7 +194,7 @@ Result<Expr> Parser::parseUnary() {
+     if (!expr) {
+       return expr;
+     }
+-    return std::make_shared<UnaryExpr>(std::move(*expr), op);
++    return std::make_shared<UnaryExpr>(loc, std::move(*expr), op);
+   }
+   default:
+     return parsePostFix();
+@@ -193,6 +202,7 @@ Result<Expr> Parser::parseUnary() {
+ }
+ 
+ Result<Expr> Parser::parsePostFix() {
++  auto loc = peek().getLoc();
+   auto expr = parsePrimary();
+   if (!expr) {
+     return expr;
+@@ -205,16 +215,13 @@ Result<Expr> Parser::parsePostFix() {
+   pos_++;
+ 
+   const auto typeIdent = tokens_[pos_];
+-  if (typeIdent.getKind() != Token::TokenKind::Ident) {
+-    std::cerr << "Expected Ident but got "
+-              << Token::tokenKindToString(typeIdent.getKind()) << std::endl;
+-    std::abort();
+-  }
++  EXPECT_EQ(typeIdent.getLoc(), typeIdent.getKind(), Token::TokenKind::Ident);
+   pos_++;
+ 
+   if (typeIdent.text()[0] != 'i') {
+-    std::cerr << "Currently only types started with 'i' is supported but got "
+-              << std::string{typeIdent.text()} << std::endl;
++    return FATAL(typeIdent.getLoc(),
++                 "Currently only types started with 'i' is supported but got ",
++                 std::string{typeIdent.text()}, "\n");
+   }
+ 
+   size_t bitWidth;
+@@ -225,17 +232,19 @@ Result<Expr> Parser::parsePostFix() {
+         std::from_chars(sv.data(), sv.data() + sv.size(), bitWidth);
+ 
+     if (ec != std::errc()) {
+-      std::cerr << "Parse BitWidth of Type failed" << std::string{sv}
+-                << std::endl;
++      return FATAL(typeIdent.getLoc(), "Parse BitWidth of Type failed",
++                   std::string{sv}, "\n");
+     }
+   }
+ 
+   return std::make_shared<CastExpr>(
+-      std::move(*expr), PrimitiveType{PrimitiveType::Kind::SInt, bitWidth});
++      loc, std::move(*expr),
++      PrimitiveType{PrimitiveType::Kind::SInt, bitWidth});
+ }
+ 
+ Result<Expr> Parser::parsePrimary() {
+-  const auto &token = tokens_[pos_];
++  const auto &token = peek();
++  auto loc = token.getLoc();
+   switch (token.getKind()) {
+   case Token::TokenKind::NumLit: {
+     int64_t result = 0;
+@@ -243,19 +252,15 @@ Result<Expr> Parser::parsePrimary() {
+         token.text().data(), token.text().data() + token.text().size(), result);
+     if (ec == std::errc()) {
+       pos_++;
+-      return std::make_shared<NumLitExpr>(result);
++      return std::make_shared<NumLitExpr>(loc, result);
+     } else {
+-      std::cerr << "Unexpected token: " << token << "\n";
+-      std::abort();
++      return FATAL(loc, "Unexpected token: ", token, "\n");
+     }
+   }
+   case Token::TokenKind::OpenParen: {
+     pos_++;
+     auto expr = parseExpr();
+-    if (tokens_[pos_].getKind() != Token::TokenKind::CloseParen) {
+-      std::cerr << "Expected ')'\n";
+-      std::abort();
+-    }
++    EXPECT_EQ(peek().getLoc(), peek().getKind(), Token::TokenKind::CloseParen);
+     pos_++;
+     return expr;
+   }
+@@ -264,10 +269,9 @@ Result<Expr> Parser::parsePrimary() {
+     std::string name{token.text()};
+     auto expr = scope_->lookup(name);
+     if (!expr) {
+-      std::cerr << "Variable '" << name << "' not found. ";
+-      std::abort();
++      return FATAL(token.getLoc(), "Variable '", name, "' not found. \n");
+     }
+-    return std::make_shared<VariableExpr>(name, *expr);
++    return std::make_shared<VariableExpr>(loc, name, *expr);
+   }
+   default:
+     return FATAL(token.getLoc(), "Unexpected token: ", token, "\n");
+
+```
+また、MLIRGenでもエラーハンドリングします。`include/mlirGen.h`では、`MLIRGen::gen`の戻り型を`Result`で包みます。`src/mlirGen.cpp`では、まず`nyacc::Location`を`mlir::Location`に変換する関数`mlirLoc`も定義しています。`MLIRGenVisitor`では、`Result<std::monostate>`を定義していて、エラーを格納できるようになっています。`parse*`関数を呼ぶたびに、`has_error`を見てエラーがあるかどうかを判定し、そうならば早期リターンをします。単純に`Result`を返していないのは、今回のVisitorでは返り型が`void`なので、`Visitor`クラスそのものに値を保存しておく必要があるからです。また、エラー情報を取り出すには、`.error()`を呼びます。
+```diff cpp:src/mlirGen.cpp
+diff --git a/src/mlirGen.cpp b/src/mlirGen.cpp
+index 6643de2..9988e09 100644
+--- a/src/mlirGen.cpp
++++ b/src/mlirGen.cpp
+@@ -5,9 +5,12 @@
+ #include "mlir/IR/Builders.h"
+ #include "mlir/IR/BuiltinOps.h"
+ #include "mlir/IR/MLIRContext.h"
++#include <error.h>
+ #include <iostream>
+ #include <mlir/Dialect/Func/IR/FuncOps.h>
+ #include <mlir/IR/BuiltinTypes.h>
++#include <mlir/IR/Location.h>
++#include <variant>
+ 
+ namespace nyacc {
+ mlir::Type asMLIRType(mlir::MLIRContext *ctx, Type type) {
+@@ -33,47 +36,71 @@ public:
+   MLIRGenVisitor(mlir::MLIRContext &context)
+       : builder_(&context),
+         module_(mlir::ModuleOp::create(builder_.getUnknownLoc())),
+-        value_(std::nullopt) {
++        value_(std::nullopt), flag_(std::monostate{}) {
+     builder_.setInsertionPointToStart(module_.getBody());
+   }
+ 
+-  mlir::OwningOpRef<mlir::ModuleOp> takeModule() { return std::move(module_); }
++  nyacc::Result<mlir::OwningOpRef<mlir::ModuleOp>> takeModule() {
++    if (auto e = error()) {
++      return *e;
++    }
++    return std::move(module_);
++  }
++
++  mlir::Location mlirLoc(nyacc::Location loc) {
++    return mlir::FileLineColLoc::get(builder_.getStringAttr(*loc.file),
++                                     loc.line, loc.col);
++  }
+ 
+   void visit(const nyacc::ModuleAST &moduleAst) override {
+     auto mainOp = builder_.create<nyacc::FuncOp>(
+-        builder_.getUnknownLoc(), "main", builder_.getFunctionType({}, {}));
++        mlirLoc(moduleAst.getLoc()), "main", builder_.getFunctionType({}, {}));
+ 
+     builder_.setInsertionPointToStart(&mainOp.front());
+ 
+     builder_.setInsertionPointToStart(&mainOp.front());
+     for (auto &stmt : moduleAst.getStmts()) {
+       stmt->accept(*this);
++      if (has_error()) {
++        return;
++      }
+     }
+     moduleAst.getExpr()->accept(*this);
+-    builder_.create<nyacc::ReturnOp>(builder_.getUnknownLoc(), value_.value());
++    if (has_error()) {
++      return;
++    }
++    builder_.create<nyacc::ReturnOp>(mlirLoc(moduleAst.getExpr()->getLoc()),
++                                     value_.value());
+   }
+ 
+   void visit(const class nyacc::DeclareStmt &node [[maybe_unused]]) override {}
+   void visit(const class nyacc::ExprStmt &node) override {
+     node.getExpr()->accept(*this);
++    if (has_error()) {
++      return;
++    }
+   }
+ 
+   void visit(const nyacc::NumLitExpr &numLit) override {
+     value_ = builder_.create<nyacc::ConstantOp>(
+-        builder_.getUnknownLoc(),
++        mlirLoc(numLit.getLoc()),
+         builder_.getI64IntegerAttr(numLit.getValue()));
+   }
+ 
+   void visit(const nyacc::UnaryExpr &unaryExpr) override {
++    auto loc = mlirLoc(unaryExpr.getLoc());
+     unaryExpr.getExpr()->accept(*this);
++    if (has_error()) {
++      return;
++    }
+     auto expr = value_.value();
+     switch (unaryExpr.getOp()) {
+     case nyacc::UnaryOp::Plus: {
+-      value_ = builder_.create<nyacc::PosOp>(builder_.getUnknownLoc(), expr);
++      value_ = builder_.create<nyacc::PosOp>(loc, expr);
+       break;
+     }
+     case nyacc::UnaryOp::Minus: {
+-      value_ = builder_.create<nyacc::NegOp>(builder_.getUnknownLoc(), expr);
++      value_ = builder_.create<nyacc::NegOp>(loc, expr);
+       break;
+     }
+     }
+@@ -81,40 +108,47 @@ public:
+ 
+   void visit(const nyacc::CastExpr &castExpr) override {
+     castExpr.getExpr()->accept(*this);
++    if (has_error()) {
++      return;
++    }
+     auto expr = value_.value();
+     mlir::Type out =
+         nyacc::asMLIRType(builder_.getContext(), castExpr.getCastTo());
+     value_ =
+-        builder_.create<nyacc::CastOp>(builder_.getUnknownLoc(), out, expr);
++        builder_.create<nyacc::CastOp>(mlirLoc(castExpr.getLoc()), out, expr);
+   }
+ 
+   void visit(const nyacc::BinaryExpr &binaryExpr) override {
++    auto astLoc = binaryExpr.getLoc();
++    auto loc = mlirLoc(astLoc);
+     binaryExpr.getLhs()->accept(*this);
++    if (has_error()) {
++      return;
++    }
+     auto lhs = value_.value();
+     binaryExpr.getRhs()->accept(*this);
++    if (has_error()) {
++      return;
++    }
+     auto rhs = value_.value();
+     // 今はAddOpのみ
+ 
+     switch (binaryExpr.getOp()) {
+     case nyacc::BinaryOp::Add: {
+-      value_ =
+-          builder_.create<nyacc::AddOp>(builder_.getUnknownLoc(), lhs, rhs);
++      value_ = builder_.create<nyacc::AddOp>(loc, lhs, rhs);
+       break;
+     }
+     case nyacc::BinaryOp::Sub: {
+-      value_ =
+-          builder_.create<nyacc::SubOp>(builder_.getUnknownLoc(), lhs, rhs);
++      value_ = builder_.create<nyacc::SubOp>(loc, lhs, rhs);
+       break;
+     }
+     case nyacc::BinaryOp::Mul: {
+-      value_ =
+-          builder_.create<nyacc::MulOp>(builder_.getUnknownLoc(), lhs, rhs);
++      value_ = builder_.create<nyacc::MulOp>(loc, lhs, rhs);
+       break;
+     }
+     case nyacc::BinaryOp::Div: {
+-      value_ =
+-          builder_.create<nyacc::DivOp>(builder_.getUnknownLoc(), lhs, rhs);
++      value_ = builder_.create<nyacc::DivOp>(loc, lhs, rhs);
+       break;
+     }
+     case nyacc::BinaryOp::Eq:
+@@ -140,17 +174,20 @@ public:
+         pred = nyacc::CmpPredicate::lt;
+         break;
+       default:
+-        std::cerr << "Unknown Comparison Operator\n";
+-        std::abort();
++        flag_ = FATAL(astLoc, "Unknown Comparison Operator",
++                      static_cast<int>(binaryExpr.getOp()), "\n");
++        return;
+       }
+ 
+-      value_ = builder_.create<nyacc::CmpOp>(builder_.getUnknownLoc(), pred,
+-                                             lhs, rhs);
++      value_ = builder_.create<nyacc::CmpOp>(loc, pred, lhs, rhs);
+     }
+     }
+   }
+   void visit(const class nyacc::VariableExpr &node) override {
+     node.getExpr()->accept(*this);
++    if (has_error()) {
++      return;
++    }
+   }
+ 
+   void visit(const class nyacc::AssignExpr &node [[maybe_unused]]) override {
+@@ -158,17 +195,26 @@ public:
+   }
+ 
+ private:
++  bool has_error() { return !flag_.has_value(); }
++  std::optional<tl::unexpected<nyacc::ErrorInfo>> error() {
++    if (flag_.has_value()) {
++      return std::nullopt;
++    } else {
++      return tl::unexpected{flag_.error()};
++    }
++  }
+   mlir::OpBuilder builder_;
+   mlir::ModuleOp module_;
+   std::optional<mlir::Value> value_;
++  nyacc::Result<std::monostate> flag_;
+ };
+ 
+ } // namespace
+ 
+ namespace nyacc {
+ 
+-mlir::OwningOpRef<mlir::ModuleOp> MLIRGen::gen(mlir::MLIRContext &context,
+-                                               const ModuleAST &moduleAst) {
++Result<mlir::OwningOpRef<mlir::ModuleOp>>
++MLIRGen::gen(mlir::MLIRContext &context, const ModuleAST &moduleAst) {
+   MLIRGenVisitor visitor{context};
+   moduleAst.accept(visitor);
+   return visitor.takeModule();
+
+```
+`src/main.cpp`で、`parseModule`した後、`MLIRGen::gen`した後にエラーチェックするようにもします。
+```cpp:src/main.cpp
+  auto moduleAstOpt = parser.parseModule();
+  if (!moduleAstOpt) {
+    std::cout << moduleAstOpt.error().error(src) << "\n";
+    return 1;
+  }
+  auto moduleAst = *moduleAstOpt;
+  // ...
+  auto moduleOpt = nyacc::MLIRGen::gen(context, moduleAst);
+  if (!moduleOpt) {
+    std::cout << moduleOpt.error().error(src) << "\n";
+    return 1;
+  }
+  auto &module = *moduleOpt;
+```
+また、`test/simpleTest.cpp`の`runNyaZy`の該当部分も修正します。
+```cpp:test/simpleTest.cpp
+  auto ast = parser.parseModule();
+  EXPECT_TRUE(ast) << ast.error().error(src) << "\n"; // ここのEXPECT_TRUEはgoogleTestのEXPECT_TRUE
+  // ...
+  auto moduleOpt = nyacc::MLIRGen::gen(context, *ast);
+  EXPECT_TRUE(moduleOpt) << moduleOpt.error().error(src) << "\n";
+  auto &module = *moduleOpt;
+```
+試しにエラーが機能するかどうか試してみましょう。たとえば、`let`の後に数字が来たらエラーになるはずです。`let 3 = 5;`で試してみましょう。これはパーサー部分でエラーになるはずです。
+```bash
+$ ./bin nyacc
+Source code:
+  let 3 = 5;
+...
+unkown-file:2:7: error: @/Users/lemolatoon/workspace/compiler/NyaZy/src/parser.cpp:47:0
+Expected:
+  peek().getKind() == Token::TokenKind::Ident
+Actual:
+  NumLit != Ident
+
+  let 3 = 5;
+      ^
+
+Error: Command 'nyacc' failed with exit code 1
+```
+いい感じにエラーメッセージが出ています！
