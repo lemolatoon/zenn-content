@@ -6177,10 +6177,280 @@ std::optional<Expr> Scope::localLookup(const std::string &name) {
 
 } // namespace nyacc
 ```
-ようやくここまででスコープが実装できたので、いよいよParserを実装していきます。`include/parser.h`と`include/parser.cpp`を編集します。
+ようやくここまででスコープが実装できたので、いよいよParserを実装していきます。`include/parser.h`と`include/parser.cpp`を編集します。`class Parser`では、コンストラクタでスコープを受け取るようにします。これがグローバルスコープになります。また、型エイリアスを導入したので、`std::unique_ptr<ExprASTNode>`などと書いていた部分を、`Expr`で書き換えています。
+`src/parser.cpp`の方でも、型エイリアスの書き換えのほか、変数に関連して、`parseModule`、`parseExpr`が大きく書き換わり、`parseAssign`と`parseDeclare`が新たに増えています。
+`parseModule`では、まず`let`から始まる場合には、`parseDeclare`で宣言としてパースします。そうでない場合は、まず`parseExpr`を呼びます。その後、`;`が続く場合は、`ExprStmt`とします。そうでない場合は、プログラム中の最後の式をして、パースを終了します。
+また、`parsePrimary`でも、新たに、`TokenKind::Ident`だった場合に、スコープから検索し、見つかった式を持った`VariableExpr`を作っています。
+`Scope`へは、`parseDeclare`と`parseAssign`でも手を加えます。`parseDeclare`では、新たに変数を作り初期化するので、`Scope::insert`を用いて、変数名に対応する式を登録します。`parseAssign`では、変数名に対応する式を書き換えます。、現段階では、ループなどはなく、同じ式は一回しか実行されないので、これで十分なはずです。
+`parseAssign`において、左辺はとりあえず`VariableExpr`であってほしいので、`ExprASTNode*`から`VariableExpr*`にキャストしています。ここで、LLVM-style RTTIを使っていたので、`llvm::cast`を用いてキャストします。C++の`static_cast`に対応します。[^llvm::dyn_cast]
+
+[^llvm::dyn_cast]: `dynamic_cast`には、`llvm::dyn_cast`が対応します。
 ```cpp:include/parser.h
+#pragma once
+
+#include "ast.h"
+#include "lexer.h"
+#include "scope.h"
+
+namespace nyacc {
+class Parser {
+public:
+  Parser(std::vector<Token> tokens)
+      : tokens_(std::move(tokens)), pos_(0),
+        global_scope_(std::make_shared<Scope>()), scope_(global_scope_) {}
+
+  ModuleAST parseModule();
+
+private:
+  Stmt parseDeclare();
+
+  Expr parseExpr();
+  Expr parseAssign();
+  Expr parseCompare();
+  Expr parseAdd();
+  Expr parseMul();
+  Expr parseUnary();
+  Expr parsePostFix();
+  Expr parsePrimary();
+
+  bool startsWith(std::initializer_list<Token::TokenKind> list) const;
+  std::vector<Token> tokens_;
+  size_t pos_{0};
+
+  std::shared_ptr<Scope> global_scope_;
+  std::shared_ptr<Scope> scope_;
+};
+} // namespace nyacc
 ```
 ```cpp:src/parser.cpp
+#include "parser.h"
+#include "ast.h"
+#include <charconv>
+#include <initializer_list>
+#include <iostream>
+#include <llvm/Support/Casting.h>
+#include <memory>
+
+namespace nyacc {
+
+ModuleAST Parser::parseModule() {
+  std::vector<Stmt> stmts;
+  Expr lastExpr;
+  while (!startsWith({Token::TokenKind::Eof})) {
+    if (startsWith({Token::TokenKind::Let})) {
+      stmts.emplace_back(parseDeclare());
+      continue;
+    }
+
+    auto expr = parseExpr();
+    if (!startsWith({Token::TokenKind::Semi})) {
+      lastExpr = std::move(expr);
+      break;
+    }
+    pos_++;
+
+    stmts.emplace_back(std::make_shared<ExprStmt>(std::move(expr)));
+  }
+  return ModuleAST(std::move(stmts), std::move(lastExpr));
+}
+
+Stmt Parser::parseDeclare() {
+  assert(startsWith({Token::TokenKind::Let}));
+  pos_++;
+
+  assert(startsWith({Token::TokenKind::Ident}));
+  auto name = std::string{tokens_[pos_].text()};
+  pos_++;
+
+  assert(startsWith({Token::TokenKind::Eq}));
+  pos_++;
+
+  auto expr = parseExpr();
+
+  assert(startsWith({Token::TokenKind::Semi}));
+  pos_++;
+
+  scope_->insert(name, expr);
+  return std::make_shared<DeclareStmt>(std::move(name), std::move(expr));
+}
+
+Expr Parser::parseExpr() { return parseAssign(); }
+
+Expr Parser::parseAssign() {
+  auto lhs = parseCompare();
+  if (startsWith({Token::TokenKind::Eq})) {
+    pos_++;
+    assert(llvm::isa<VariableExpr>(lhs.get()));
+    auto rhs = parseCompare();
+    auto var_expr = llvm::cast<VariableExpr>(lhs.get());
+    scope_->insert(var_expr->getName(), rhs);
+    return std::make_shared<AssignExpr>(std::move(lhs), std::move(rhs));
+  }
+
+  return lhs;
+}
+
+// parseCompareが続く...
+
+Expr Parser::parsePrimary() {
+  const auto &token = tokens_[pos_];
+  switch (token.getKind()) {
+  case Token::TokenKind::NumLit: {
+    int64_t result = 0;
+    auto [ptr, ec] = std::from_chars(
+        token.text().data(), token.text().data() + token.text().size(), result);
+    if (ec == std::errc()) {
+      pos_++;
+      return std::make_shared<NumLitExpr>(result);
+    } else {
+      std::cerr << "Unexpected token: " << token << "\n";
+      std::abort();
+    }
+  }
+  case Token::TokenKind::OpenParen: {
+    pos_++;
+    auto expr = parseExpr();
+    if (tokens_[pos_].getKind() != Token::TokenKind::CloseParen) {
+      std::cerr << "Expected ')'\n";
+      std::abort();
+    }
+    pos_++;
+    return expr;
+  }
+  case Token::TokenKind::Ident: {
+    pos_++;
+    std::string name{token.text()};
+    auto expr = scope_->lookup(name);
+    if (!expr) {
+      std::cerr << "Variable '" << name << "' not found. ";
+      std::abort();
+    }
+    return std::make_shared<VariableExpr>(name, *expr);
+  }
+  default:
+    std::cerr << "Unexpected token: " << token << "\n";
+    std::abort();
+    break;
+  }
+}
+
+} // namespace nyacc
+```
+
+#### MLIRGenの実装
+それでは、追加した文、式に対するMLIRの生成を変更します。そうはいってもほとんど変わりません。`AssignExpr`と、`DeclareExpr`はコンパイル時に変数の中身を変えているだけなので、実行時にはなにもしません。`VariableExpr`に対しては、対応する式を生成します。`Module`は文を連ねて、最後に式を生成して、それを`return`するようにします。`src/mlirGen.cpp`を編集します。
+```cpp:src/mlirGen.cpp
+#include "mlirGen.h"
+#include "ast.h"
+#include "ir/NyaZyDialect.h"
+#include "ir/NyaZyOps.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include <iostream>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/IR/BuiltinTypes.h>
+
+namespace nyacc {
+mlir::Type asMLIRType(mlir::MLIRContext *ctx, Type type) {
+  switch (type.getKind()) {
+  case Type::TypeKind::Primitive:
+    return asMLIRType(ctx, llvm::cast<PrimitiveType>(type));
+  }
+}
+
+mlir::Type asMLIRType(mlir::MLIRContext *ctx, PrimitiveType type) {
+  switch (type.getPrimitiveKind()) {
+  case PrimitiveType::Kind::SInt:
+    return mlir::IntegerType::get(ctx, type.getBitWidth());
+  }
+}
+
+} // namespace nyacc
+
+namespace {
+
+class MLIRGenVisitor : public nyacc::Visitor {
+public:
+// ...
+  void visit(const nyacc::ModuleAST &moduleAst) override {
+    auto mainOp = builder_.create<nyacc::FuncOp>(
+        builder_.getUnknownLoc(), "main", builder_.getFunctionType({}, {}));
+
+    builder_.setInsertionPointToStart(&mainOp.front());
+
+    builder_.setInsertionPointToStart(&mainOp.front());
+    for (auto &stmt : moduleAst.getStmts()) {
+      stmt->accept(*this);
+    }
+    moduleAst.getExpr()->accept(*this);
+    builder_.create<nyacc::ReturnOp>(builder_.getUnknownLoc(), value_.value());
+  }
+
+  void visit(const class nyacc::DeclareStmt &node [[maybe_unused]]) override {}
+  void visit(const class nyacc::ExprStmt &node) override {
+    node.getExpr()->accept(*this);
+  }
+  void visit(const class nyacc::VariableExpr &node) override {
+    node.getExpr()->accept(*this);
+  }
+
+  void visit(const class nyacc::AssignExpr &node [[maybe_unused]]) override {
+    // noop
+  }
+// ...
+private:
+// ...
+};
+
+} // namespace
+```
+#### 実行してみる
+それでは実行して確認します。
+```bash
+$ ./bin nyacc
+Source Code:
+  let a = 5 * 2; a
+...
+MLIR:
+module {
+  nyazy.func @main() {
+    %0 = nyazy.constant 5 : i64
+    %1 = nyazy.constant 2 : i64
+    %2 = "nyazy.mul"(%0, %1) : (i64, i64) -> i64
+    "nyazy.return"(%2) : (i64) -> ()
+  }
+}
+Lowered MLIR:
+module {
+  llvm.func @main() -> i64 {
+    %0 = llvm.mlir.constant(5 : i64) : i64
+    %1 = llvm.mlir.constant(2 : i64) : i64
+    %2 = llvm.mul %0, %1 : i64
+    llvm.return %2 : i64
+  }
+}
+Generated LLVM IR:
+; ModuleID = 'LLVMDialectModule'
+source_filename = "LLVMDialectModule"
+
+define i64 @main() {
+  ret i64 10
+}
+$ ./bin lli output.ll
+$ echo $? # or `echo $status`
+10
+```
+うまくできていそうです！テストにも追加しておきましょう。
+```cpp:test/simpletest.cpp
+TEST(SimpleTest, Variable) {
+  EXPECT_EQ(10, runNyaZy("let a = 5 * 2; a"));
+
+  EXPECT_EQ(8, runNyaZy("let a = 5; let b = 3; a + b"));
+
+  // shadowing
+  EXPECT_EQ(12, runNyaZy("let a = 5; let a = a + 7; a"));
+}
 ```
 
 ### Step10 パースエラーのハンドリングをする
